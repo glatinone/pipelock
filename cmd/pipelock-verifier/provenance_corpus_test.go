@@ -297,7 +297,10 @@ func appendCorpusEntry(t *testing.T, fixture *provenanceFixture) {
 func writeProvenanceCase(t *testing.T, dir, id string, fixture provenanceFixture) {
 	t.Helper()
 	writeJSONFile(t, filepath.Join(dir, id+".json"), fixture)
-	writeJSONFile(t, filepath.Join(dir, id+".expect.json"), verifyProvenanceFixture(fixture))
+	// Expected staged reports are normative known answers, not generated
+	// output. Recomputing them through the Go verifier would let a shared bug
+	// bless itself during regeneration and make four-way agreement vacuous.
+	// New cases require a separately reviewed, hand-authored .expect.json file.
 }
 
 func writeJSONFile(t *testing.T, path string, value any) {
