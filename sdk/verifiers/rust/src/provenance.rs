@@ -546,6 +546,9 @@ fn parse_recipe(value: &Value) -> std::result::Result<Recipe, String> {
         "recipe",
     )?;
     let profile = string(recipe, "transform_profile_digest", "recipe")?.to_string();
+    if profile.is_empty() {
+        return Err("missing transform profile digest".into());
+    }
     if profile != PROFILE_DIGEST {
         return Err("recipe: unknown transform profile".into());
     }
@@ -598,8 +601,17 @@ fn parse_recipe(value: &Value) -> std::result::Result<Recipe, String> {
 }
 
 fn validate_operation(op: &Operation) -> std::result::Result<(), String> {
-    if op.selector.chars().any(char::is_control) || op.profile.chars().any(char::is_control) {
-        return Err("operation: control character".into());
+    if op.selector.chars().any(char::is_control) {
+        return Err(format!(
+            "selector for {} contains control character",
+            op.kind
+        ));
+    }
+    if op.profile.chars().any(char::is_control) {
+        return Err(format!(
+            "profile for {} contains control character",
+            op.kind
+        ));
     }
     let empty = || {
         op.component.is_empty()
@@ -615,6 +627,12 @@ fn validate_operation(op: &Operation) -> std::result::Result<(), String> {
             if empty() =>
         {
             Ok(())
+        }
+        "url_component"
+            if matches!(op.component.as_str(), "query_key" | "query_value")
+                && op.selector.is_empty() =>
+        {
+            Err("query component: missing selector".into())
         }
         "url_component" => match op.component.as_str() {
             "url" | "hostname" | "path"
@@ -634,8 +652,14 @@ fn validate_operation(op: &Operation) -> std::result::Result<(), String> {
             {
                 Ok(())
             }
-            _ => Err("url_component: invalid parameters".into()),
+            "url" | "hostname" | "path" | "query_key" | "query_value" => {
+                Err("url_component: unsupported parameters".into())
+            }
+            _ => Err(format!("unknown URL component {:?}", op.component)),
         },
+        "percent_decode" if op.passes == 0 || op.passes > 4 => {
+            Err("percent decode passes must be 1..4".into())
+        }
         "percent_decode"
             if (1..=4).contains(&op.passes)
                 && op.component.is_empty()
@@ -645,6 +669,9 @@ fn validate_operation(op: &Operation) -> std::result::Result<(), String> {
                 && !op.padding =>
         {
             Ok(())
+        }
+        "dlp_normalize" if op.profile != "pipelock-dlp-v1" => {
+            Err(format!("unknown DLP profile {:?}", op.profile))
         }
         "dlp_normalize"
             if op.profile == "pipelock-dlp-v1"
@@ -665,7 +692,11 @@ fn validate_operation(op: &Operation) -> std::result::Result<(), String> {
         {
             Ok(())
         }
-        _ => Err("operation: unsupported parameters or kind".into()),
+        "identity" | "lowercase" | "invisible_strip" | "leetspeak" | "vowel_fold"
+        | "hex_decode" | "percent_decode" | "dlp_normalize" | "base32_decode" | "base64_decode" => {
+            Err(format!("unsupported parameters for {}", op.kind))
+        }
+        _ => Err(format!("unknown operation {:?}", op.kind)),
     }
 }
 
@@ -771,7 +802,10 @@ fn url_component(value: &str, op: &Operation) -> std::result::Result<String, Str
                 .filter(|(key, _)| key == &op.selector)
                 .collect::<Vec<_>>();
             let Some((_, value)) = values.get(op.occurrence as usize) else {
-                return Err("query occurrence unavailable".into());
+                return Err(format!(
+                    "query component: occurrence {} unavailable",
+                    op.occurrence
+                ));
             };
             if op.component == "query_key" {
                 Ok(op.selector.clone())
@@ -820,12 +854,12 @@ fn percent_decode(value: &str) -> std::result::Result<String, String> {
             index += 1;
         }
     }
-    String::from_utf8(out).map_err(|_| "percent decode output invalid UTF-8".into())
+    String::from_utf8(out).map_err(|_| "percent decode output: invalid UTF-8".into())
 }
 fn canonical_hex(value: &str) -> std::result::Result<String, String> {
     let bytes = hex::decode(value).map_err(|_| "hex decode".to_string())?;
     if hex::encode(&bytes) != value {
-        return Err("hex non-canonical".into());
+        return Err("hex decode: non-canonical encoding".into());
     };
     String::from_utf8(bytes).map_err(|_| "hex output invalid UTF-8".into())
 }
@@ -956,7 +990,7 @@ fn confusable(c: char) -> char {
         '\u{0421}' => 'C',
         '\u{0415}' | '\u{0395}' | '\u{13a1}' => 'E',
         '\u{041d}' | '\u{0397}' => 'H',
-        '\u{0406}' => 'I',
+        '\u{0406}' | '\u{13a2}' => 'I',
         '\u{0408}' => 'J',
         '\u{041a}' | '\u{039a}' => 'K',
         '\u{041c}' | '\u{039c}' => 'M',
@@ -965,6 +999,7 @@ fn confusable(c: char) -> char {
         '\u{0405}' | '\u{054d}' | '\u{13da}' => 'S',
         '\u{0422}' | '\u{03a4}' | '\u{13d4}' => 'T',
         '\u{0425}' | '\u{03a7}' => 'X',
+        '\u{13b3}' => 'W',
         '\u{0396}' => 'Z',
         '\u{0399}' => 'I',
         '\u{039d}' => 'N',
@@ -1063,6 +1098,13 @@ fn byte_interval_valid(view: &str, start: u64, end: u64) -> bool {
             || (start < view.len() as u64 && view.as_bytes()[start as usize] & 0xc0 != 0x80))
         && (end == view.len() as u64
             || (end < view.len() as u64 && view.as_bytes()[end as usize] & 0xc0 != 0x80))
+}
+
+#[cfg(test)]
+fn byte_boundary(view: &str, offset: u64) -> bool {
+    offset == 0
+        || offset == view.len() as u64
+        || (offset < view.len() as u64 && view.as_bytes()[offset as usize] & 0xc0 != 0x80)
 }
 
 fn object<'a>(
@@ -1196,7 +1238,140 @@ fn valid_digest(value: &str, prefix: &str) -> std::result::Result<(), String> {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use serde::Deserialize;
     use serde_json::json;
+
+    #[derive(Deserialize)]
+    struct TransformCorpus {
+        profile_digest: String,
+        vectors: Vec<TransformVector>,
+        interval_vectors: Vec<IntervalVector>,
+    }
+
+    #[derive(Deserialize)]
+    struct TransformVector {
+        id: String,
+        input_b64: String,
+        #[serde(default)]
+        output_b64: String,
+        #[serde(default)]
+        want_error: String,
+        transform_profile_digest: Option<String>,
+        recipe: Option<Value>,
+    }
+
+    #[derive(Deserialize)]
+    struct IntervalVector {
+        id: String,
+        view_b64: String,
+        matches: Vec<[u64; 2]>,
+        want_error: String,
+    }
+
+    #[test]
+    fn transform_profile_corpus_is_byte_exact() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../conformance/testdata/transform-profile/evidence-provenance-v1.json"
+        );
+        let corpus: TransformCorpus =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let TransformCorpus {
+            profile_digest,
+            vectors,
+            ..
+        } = corpus;
+        assert_eq!(vectors.len(), 29, "corpus vector count changed");
+        for vector in vectors {
+            let input = STANDARD.decode(&vector.input_b64).unwrap();
+            let result = String::from_utf8(input)
+                .map_err(|_| "invalid UTF-8".to_string())
+                .and_then(|input| {
+                    let recipe = json!({
+                        "transform_profile_digest": vector
+                            .transform_profile_digest
+                            .as_deref()
+                            .unwrap_or(&profile_digest),
+                        "operations": vector.recipe.unwrap_or_else(|| json!([])),
+                    });
+                    parse_recipe(&recipe).and_then(|recipe| apply_recipe(&input, &recipe))
+                });
+            if vector.want_error.is_empty() {
+                let output = STANDARD.decode(&vector.output_b64).unwrap();
+                assert_eq!(result.unwrap().as_bytes(), output, "{}", vector.id);
+            } else {
+                let error = result.expect_err(&vector.id);
+                assert!(
+                    error.contains(&vector.want_error),
+                    "{} error={error:?} want={:?}",
+                    vector.id,
+                    vector.want_error
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn interval_corpus_exercises_utf8_boundaries_and_ordering() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../conformance/testdata/transform-profile/evidence-provenance-v1.json"
+        );
+        let corpus: TransformCorpus =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            corpus.interval_vectors.len(),
+            8,
+            "interval vector count changed"
+        );
+        for vector in corpus.interval_vectors {
+            let view = String::from_utf8(STANDARD.decode(&vector.view_b64).unwrap()).unwrap();
+            let result = validate_interval_corpus_vector(&view, &vector.matches);
+            if vector.want_error.is_empty() {
+                result.unwrap();
+            } else {
+                let error = result.expect_err(&vector.id);
+                assert!(
+                    error.contains(&vector.want_error),
+                    "{} error={error:?} want={:?}",
+                    vector.id,
+                    vector.want_error
+                );
+            }
+        }
+    }
+
+    fn validate_interval_corpus_vector(
+        view: &str,
+        matches: &[[u64; 2]],
+    ) -> std::result::Result<(), String> {
+        let mut previous: Option<[u64; 2]> = None;
+        for bounds in matches {
+            let [start, end] = *bounds;
+            if end <= start {
+                return Err("byte end must be greater".into());
+            }
+            if end > view.len() as u64 {
+                return Err("out of bounds".into());
+            }
+            if !byte_boundary(view, start) || !byte_boundary(view, end) {
+                return Err("splits UTF-8".into());
+            }
+            if let Some([previous_start, previous_end]) = previous {
+                if start < previous_start {
+                    return Err("unsorted".into());
+                }
+                if start == previous_start {
+                    return Err("duplicate".into());
+                }
+                if start < previous_end {
+                    return Err("overlap".into());
+                }
+            }
+            previous = Some([start, end]);
+        }
+        Ok(())
+    }
 
     #[test]
     fn valid_fixture_is_incomplete_without_commitment_key() {

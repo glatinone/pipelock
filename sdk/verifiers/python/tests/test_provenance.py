@@ -8,16 +8,30 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
+from pathlib import Path
 
+import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from pipelock_aarp_verify.number import parse_json_strict
 from pipelock_aarp_verify.provenance import (
     FIXTURE_FORMAT,
     PROFILE_DIGEST,
+    ProvenanceError,
+    _apply_recipe,
     _commit,
     _recipe_bytes,
+    _validate_intervals,
     verify_fixture,
+)
+
+_TRANSFORM_CORPUS = (
+    Path(__file__).resolve().parents[3]
+    / "conformance"
+    / "testdata"
+    / "transform-profile"
+    / "evidence-provenance-v1.json"
 )
 
 
@@ -226,3 +240,41 @@ def test_missing_source_does_not_hide_later_available_source_mismatch() -> None:
     assert output["location"] == "not_checked"
     assert output["match_commitment"] == "mismatch"
     assert output["failure_stage"] == "view_commitment"
+
+
+def test_transform_corpus_vectors_are_byte_exact() -> None:
+    """The Python port executes every normative recipe vector directly."""
+    corpus = json.loads(_TRANSFORM_CORPUS.read_text())
+    assert len(corpus["vectors"]) == 29
+    for vector in corpus["vectors"]:
+        recipe = {
+            "transform_profile_digest": vector.get(
+                "transform_profile_digest", PROFILE_DIGEST
+            ),
+            "operations": vector.get("recipe") or [],
+        }
+        strict_recipe = parse_json_strict(json.dumps(recipe).encode())
+        input_bytes = base64.b64decode(vector["input_b64"])
+        want_error = vector.get("want_error", "")
+        if want_error:
+            with pytest.raises(ProvenanceError, match=re.escape(want_error)):
+                _apply_recipe(strict_recipe, input_bytes)
+            continue
+        assert _apply_recipe(strict_recipe, input_bytes) == base64.b64decode(
+            vector["output_b64"]
+        ), vector["id"]
+
+
+def test_interval_corpus_vectors_are_byte_exact() -> None:
+    """Every profile interval edge is checked as UTF-8 byte coordinates."""
+    corpus = json.loads(_TRANSFORM_CORPUS.read_text())
+    assert len(corpus["interval_vectors"]) == 8
+    for vector in corpus["interval_vectors"]:
+        view = base64.b64decode(vector["view_b64"])
+        matches = [tuple(bounds) for bounds in vector["matches"]]
+        want_error = vector["want_error"]
+        if want_error:
+            with pytest.raises(ProvenanceError, match=re.escape(want_error)):
+                _validate_intervals(view, matches)
+            continue
+        _validate_intervals(view, matches)

@@ -428,11 +428,15 @@ function validateProofStructure(proof: Proof): void {
 }
 
 function validateRecipe(recipe: Source["recipe"]): void {
+  if (recipe.transform_profile_digest === "")
+    throw new FixtureError("recipe: missing transform profile digest");
   if (recipe.transform_profile_digest !== profileDigest)
     throw new FixtureError("unknown transform profile");
   for (const op of recipe.operations) {
-    if (/\p{Cc}/u.test(op.selector) || /\p{Cc}/u.test(op.profile))
-      throw new FixtureError("recipe control character");
+    if (/\p{Cc}/u.test(op.selector))
+      throw new FixtureError(`selector for ${op.kind} contains control character`);
+    if (/\p{Cc}/u.test(op.profile))
+      throw new FixtureError(`profile for ${op.kind} contains control character`);
     const noParams = (): boolean =>
       op.component === "" &&
       op.selector === "" &&
@@ -460,9 +464,9 @@ function validateRecipe(recipe: Source["recipe"]): void {
         } else throw new FixtureError("unknown URL component");
         break;
       case "percent_decode":
+        if (op.passes < 1 || op.passes > 4)
+          throw new FixtureError("percent decode passes must be 1..4");
         if (
-          op.passes < 1 ||
-          op.passes > 4 ||
           op.component !== "" ||
           op.selector !== "" ||
           op.occurrence !== 0 ||
@@ -473,8 +477,9 @@ function validateRecipe(recipe: Source["recipe"]): void {
         }
         break;
       case "dlp_normalize":
+        if (op.profile !== "pipelock-dlp-v1")
+          throw new FixtureError(`unknown DLP profile ${JSON.stringify(op.profile)}`);
         if (
-          op.profile !== "pipelock-dlp-v1" ||
           op.component !== "" ||
           op.selector !== "" ||
           op.occurrence !== 0 ||
@@ -593,11 +598,23 @@ function commitMatch(key: Buffer, source: Source, match: Match): string {
 }
 
 function decodePercent(value: string): string {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    throw new FixtureError("percent decode failed");
+  const chunks: Buffer[] = [];
+  for (let index = 0; index < value.length; ) {
+    if (value[index] === "%") {
+      const encoded = value.slice(index + 1, index + 3);
+      if (!/^[0-9a-fA-F]{2}$/u.test(encoded))
+        throw new FixtureError("percent decode: malformed escape");
+      chunks.push(Buffer.from([Number.parseInt(encoded, 16)]));
+      index += 3;
+      continue;
+    }
+    const point = value.codePointAt(index);
+    if (point === undefined) break;
+    const character = String.fromCodePoint(point);
+    chunks.push(Buffer.from(character, "utf8"));
+    index += character.length;
   }
+  return utf8(Buffer.concat(chunks), "percent decode output");
 }
 
 function queryValues(raw: string, selector: string): string[] {
@@ -677,39 +694,126 @@ function invisibleStrip(value: string): string {
     .join("");
 }
 
+// The canonical transform profile owns this exact Unicode 15.0 mapping. Keep
+// the single-code-point table and the two alphabetic ranges explicit here: a
+// partial "common confusables" list would silently make a fixture verifier
+// disagree with the pinned profile on an attacker-controlled character.
+const dlpConfusables: Readonly<Record<string, string>> = {
+  "\u0410": "A",
+  "\u0412": "B",
+  "\u0421": "C",
+  "\u0415": "E",
+  "\u041d": "H",
+  "\u0406": "I",
+  "\u0408": "J",
+  "\u041a": "K",
+  "\u041c": "M",
+  "\u041e": "O",
+  "\u0420": "P",
+  "\u0405": "S",
+  "\u0422": "T",
+  "\u0425": "X",
+  "\u0430": "a",
+  "\u0432": "v",
+  "\u0435": "e",
+  "\u043d": "h",
+  "\u0456": "i",
+  "\u043a": "k",
+  "\u043c": "m",
+  "\u043e": "o",
+  "\u0440": "p",
+  "\u0441": "c",
+  "\u0442": "t",
+  "\u0443": "y",
+  "\u0445": "x",
+  "\u0458": "j",
+  "\u0455": "s",
+  "\u0391": "A",
+  "\u0392": "B",
+  "\u0395": "E",
+  "\u0396": "Z",
+  "\u0397": "H",
+  "\u0399": "I",
+  "\u039a": "K",
+  "\u039c": "M",
+  "\u039d": "N",
+  "\u039f": "O",
+  "\u03a1": "P",
+  "\u03a4": "T",
+  "\u03a5": "Y",
+  "\u03a7": "X",
+  "\u03b1": "a",
+  "\u03b5": "e",
+  "\u03b9": "i",
+  "\u03ba": "k",
+  "\u03bd": "v",
+  "\u03bf": "o",
+  "\u0555": "O",
+  "\u0585": "o",
+  "\u054d": "S",
+  "\u057d": "s",
+  "\u054c": "L",
+  "\u0570": "h",
+  "\u0578": "n",
+  "\u057c": "n",
+  "\u0561": "a",
+  "\u13aa": "A",
+  "\u13a2": "I",
+  "\u13d2": "P",
+  "\u13da": "S",
+  "\u13a1": "E",
+  "\u13b3": "W",
+  "\u13d4": "T",
+  "\u00d8": "O",
+  "\u00f8": "o",
+  "\u0110": "D",
+  "\u0111": "d",
+  "\u0141": "L",
+  "\u0142": "l",
+  "\u0126": "H",
+  "\u0127": "h",
+  "\u0166": "T",
+  "\u0167": "t",
+  "\u1d00": "A",
+  "\u0299": "B",
+  "\u1d04": "C",
+  "\u1d05": "D",
+  "\u1d07": "E",
+  "\ua730": "F",
+  "\u0262": "G",
+  "\u029c": "H",
+  "\u026a": "I",
+  "\u1d0a": "J",
+  "\u1d0b": "K",
+  "\u029f": "L",
+  "\u1d0d": "M",
+  "\u0274": "N",
+  "\u1d0f": "O",
+  "\u1d18": "P",
+  "\u0280": "R",
+  "\ua731": "S",
+  "\u1d1b": "T",
+  "\u1d1c": "U",
+  "\u1d20": "V",
+  "\u1d21": "W",
+  "\u028f": "Y",
+  "\u1d22": "Z",
+};
+
+function dlpConfusable(char: string): string {
+  const point = char.codePointAt(0) ?? 0;
+  if (point >= 0x1f170 && point <= 0x1f189) return String.fromCharCode(65 + point - 0x1f170);
+  if (point >= 0x1f1e6 && point <= 0x1f1ff) return String.fromCharCode(65 + point - 0x1f1e6);
+  return dlpConfusables[char] ?? char;
+}
+
 function dlpNormalize(value: string): string {
   const stripped = invisibleStrip(value).replace(/[\u0009\u000a\u000d]/gu, "");
   const noExoticSpace = stripped.replace(
     /[\u00a0\u1680\u180e\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/gu,
     "",
   );
-  const confusables: Record<string, string> = {
-    а: "a",
-    е: "e",
-    о: "o",
-    р: "p",
-    с: "c",
-    х: "x",
-    Α: "A",
-    Β: "B",
-    Ε: "E",
-    Ι: "I",
-    Κ: "K",
-    Μ: "M",
-    Ν: "N",
-    Ο: "O",
-    Ρ: "P",
-    Τ: "T",
-    Χ: "X",
-    ο: "o",
-    α: "a",
-    і: "i",
-    Ø: "O",
-    ø: "o",
-    Ł: "L",
-    ł: "l",
-  };
-  return Array.from(noExoticSpace.normalize("NFKC"), (ch) => confusables[ch] ?? ch)
+  return Array.from(noExoticSpace.normalize("NFKC"), dlpConfusable)
     .join("")
     .normalize("NFD")
     .replace(/\p{Mn}/gu, "");
@@ -766,7 +870,7 @@ function applyRecipe(recipe: Source["recipe"], input: string): string {
         value = invisibleStrip(value);
         break;
       case "hex_decode": {
-        if (!/^[0-9a-f]*$/u.test(value) || value.length % 2 !== 0)
+        if (!/^[0-9a-fA-F]*$/u.test(value) || value.length % 2 !== 0)
           throw new FixtureError("hex decode failed");
         const decoded = Buffer.from(value, "hex");
         if (decoded.toString("hex") !== value)
@@ -803,6 +907,24 @@ function applyRecipe(recipe: Source["recipe"], input: string): string {
   return value;
 }
 
+// executeProvenanceRecipe is the narrow fixture-only test seam used by the
+// shared transform corpus. It accepts raw bytes so invalid UTF-8 is rejected
+// before JavaScript can substitute replacement characters.
+export function executeProvenanceRecipe(recipeValue: unknown, input: Buffer): Buffer {
+  const raw = utf8(input, "recipe input");
+  const recipeObject = object(recipeValue, "recipe");
+  exactKeys(recipeObject, ["transform_profile_digest", "operations"], "recipe");
+  const recipe: Source["recipe"] = {
+    transform_profile_digest: string(
+      recipeObject.transform_profile_digest,
+      "recipe transform profile digest",
+    ),
+    operations: array(recipeObject.operations, "recipe.operations").map(parseOperation),
+  };
+  validateRecipe(recipe);
+  return Buffer.from(applyRecipe(recipe, raw), "utf8");
+}
+
 function decodeRawBase64(value: string): Buffer {
   if (!/^[A-Za-z0-9+/]*$/u.test(value) || value.length % 4 === 1)
     throw new FixtureError("base64 decode failed");
@@ -816,6 +938,26 @@ function decodeRawBase64(value: string): Buffer {
 function boundary(bytes: Buffer, offset: bigint): boolean {
   if (offset === 0n || offset === BigInt(bytes.length)) return true;
   return offset < BigInt(bytes.length) && (bytes[Number(offset)]! & 0xc0) !== 0x80;
+}
+
+export function validateProvenanceIntervals(
+  view: Buffer,
+  intervals: Array<readonly [bigint, bigint]>,
+): void {
+  utf8(view, "view");
+  let previousStart = -1n;
+  let previousEnd = -1n;
+  for (const [start, end] of intervals) {
+    if (end <= start) throw new FixtureError("byte end must be greater than byte start");
+    if (start < previousStart) throw new FixtureError("intervals are unsorted");
+    if (start === previousStart) throw new FixtureError("duplicate interval start");
+    if (start < previousEnd) throw new FixtureError("intervals overlap");
+    if (end > BigInt(view.length)) throw new FixtureError("interval out of bounds");
+    if (!boundary(view, start) || !boundary(view, end))
+      throw new FixtureError("interval splits UTF-8 code point");
+    previousStart = start;
+    previousEnd = end;
+  }
 }
 
 function artifacts(proof: Proof, fixture: Fixture): ArtifactStage {

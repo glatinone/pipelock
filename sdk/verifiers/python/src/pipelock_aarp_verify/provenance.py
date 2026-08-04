@@ -169,6 +169,8 @@ def _frame(value: bytes) -> bytes:
 
 def _recipe_bytes(recipe: dict[str, Any]) -> bytes:
     profile = _require_str(recipe["transform_profile_digest"], "recipe profile")
+    if profile == "":
+        raise ProvenanceError("proof_structure", "missing transform profile digest")
     if profile != PROFILE_DIGEST:
         raise ProvenanceError("proof_structure", "unknown transform profile")
     operations = recipe["operations"]
@@ -231,9 +233,13 @@ def _validate_operation(
         raise ProvenanceError("proof_structure", f"unknown operation {kind!r}")
     if component not in _COMPONENT_BYTES:
         raise ProvenanceError("proof_structure", f"unknown URL component {component!r}")
-    if _has_control(selector) or _has_control(profile):
+    if _has_control(selector):
         raise ProvenanceError(
-            "proof_structure", "operation contains a control character"
+            "proof_structure", f"selector for {kind} contains control character"
+        )
+    if _has_control(profile):
+        raise ProvenanceError(
+            "proof_structure", f"profile for {kind} contains control character"
         )
     none = (
         component == ""
@@ -282,18 +288,13 @@ def _validate_operation(
             or not 1 <= passes <= 4
         ):
             raise ProvenanceError(
-                "proof_structure", "invalid percent decode parameters"
+                "proof_structure", "percent decode passes must be 1..4"
             )
         return
     if kind == "dlp_normalize":
-        if (
-            component
-            or selector
-            or occurrence
-            or passes
-            or padding
-            or profile != "pipelock-dlp-v1"
-        ):
+        if profile != "pipelock-dlp-v1":
+            raise ProvenanceError("proof_structure", f"unknown DLP profile {profile!r}")
+        if component or selector or occurrence or passes or padding:
             raise ProvenanceError("proof_structure", "invalid DLP normalize parameters")
         return
     if kind in {"base32_decode", "base64_decode"} and (
@@ -302,7 +303,7 @@ def _validate_operation(
         raise ProvenanceError("proof_structure", "invalid base decoder parameters")
 
 
-def _check_percent(value: str) -> None:
+def _check_percent(value: str, label: str = "percent decode") -> None:
     for index, char in enumerate(value):
         if char == "%" and (
             index + 2 >= len(value)
@@ -310,14 +311,16 @@ def _check_percent(value: str) -> None:
                 c not in "0123456789abcdefABCDEF" for c in value[index + 1 : index + 3]
             )
         ):
-            raise ProvenanceError("view_reproduction", "malformed percent escape")
+            raise ProvenanceError("view_reproduction", f"{label}: malformed escape")
 
 
-def _strip_invisible(value: str) -> str:
+def _strip_invisible(value: str, *, preserve_whitespace: bool = True) -> str:
     keep = []
     for char in value:
         code = ord(char)
-        if (code < 32 and char not in "\t\n\r") or 127 <= code <= 159:
+        if (
+            code < 32 and (not preserve_whitespace or char not in "\t\n\r")
+        ) or 127 <= code <= 159:
             continue
         if (
             code in {0xAD, 0x3164, 0xFEFF}
@@ -387,12 +390,77 @@ _CONFUSABLES = str.maketrans(
         "κ": "k",
         "ν": "v",
         "ο": "o",
+        "Օ": "O",
+        "օ": "o",
+        "Ս": "S",
+        "ս": "s",
+        "Լ": "L",
+        "հ": "h",
+        "ո": "n",
+        "ռ": "n",
+        "ա": "a",
+        "Ꭺ": "A",
+        "Ꭲ": "I",
+        "Ꮲ": "P",
+        "Ꮪ": "S",
+        "Ꭱ": "E",
+        "Ꮃ": "W",
+        "Ꮤ": "T",
+        "Ø": "O",
+        "ø": "o",
+        "Đ": "D",
+        "đ": "d",
+        "Ł": "L",
+        "ł": "l",
+        "Ħ": "H",
+        "ħ": "h",
+        "Ŧ": "T",
+        "ŧ": "t",
+        "ᴀ": "A",
+        "ʙ": "B",
+        "ᴄ": "C",
+        "ᴅ": "D",
+        "ᴇ": "E",
+        "ꜰ": "F",
+        "ɢ": "G",
+        "ʜ": "H",
+        "ɪ": "I",
+        "ᴊ": "J",
+        "ᴋ": "K",
+        "ʟ": "L",
+        "ᴍ": "M",
+        "ɴ": "N",
+        "ᴏ": "O",
+        "ᴘ": "P",
+        "ʀ": "R",
+        "ꜱ": "S",
+        "ᴛ": "T",
+        "ᴜ": "U",
+        "ᴠ": "V",
+        "ᴡ": "W",
+        "ʏ": "Y",
+        "ᴢ": "Z",
     }
 )
 
 
+def _confusable_to_ascii(value: str) -> str:
+    """Apply the profile's explicit map and its two alphabetic ranges."""
+    mapped = value.translate(_CONFUSABLES)
+    result = []
+    for char in mapped:
+        code = ord(char)
+        if 0x1F170 <= code <= 0x1F189:
+            result.append(chr(ord("A") + code - 0x1F170))
+        elif 0x1F1E6 <= code <= 0x1F1FF:
+            result.append(chr(ord("A") + code - 0x1F1E6))
+        else:
+            result.append(char)
+    return "".join(result)
+
+
 def _dlp_normalize(value: str) -> str:
-    value = _strip_invisible(value)
+    value = _strip_invisible(value, preserve_whitespace=False)
     value = "".join(
         ""
         if ord(char)
@@ -410,7 +478,7 @@ def _dlp_normalize(value: str) -> str:
         else char
         for char in value
     )
-    value = unicodedata.normalize("NFKC", value).translate(_CONFUSABLES)
+    value = _confusable_to_ascii(unicodedata.normalize("NFKC", value))
     return "".join(
         char
         for char in unicodedata.normalize("NFD", value)
@@ -431,7 +499,7 @@ def _url_component(value: str, component: str, selector: str, occurrence: int) -
         return parsed.hostname or ""
     if component == "path":
         return parsed.path
-    _check_percent(parsed.query)
+    _check_percent(parsed.query, "query parse")
     pairs: list[tuple[str, str]] = []
     for part in parsed.query.split("&"):
         key, sep, item = part.partition("=")
@@ -443,7 +511,9 @@ def _url_component(value: str, component: str, selector: str, occurrence: int) -
         )
     values = [item for key, item in pairs if key == selector]
     if occurrence >= len(values):
-        raise ProvenanceError("view_reproduction", "query occurrence unavailable")
+        raise ProvenanceError(
+            "view_reproduction", f"query occurrence {occurrence} unavailable"
+        )
     return selector if component == "query_key" else values[occurrence]
 
 
@@ -467,7 +537,12 @@ def _apply_recipe(recipe: dict[str, Any], source: bytes) -> bytes:
         elif kind == "percent_decode":
             for _ in range(int(raw.get("passes", IJSONNumber("0")).literal)):
                 _check_percent(value)
-                value = unquote_to_bytes(value).decode("utf-8", "strict")
+                try:
+                    value = unquote_to_bytes(value).decode("utf-8", "strict")
+                except UnicodeDecodeError as exc:
+                    raise ProvenanceError(
+                        "view_reproduction", "output: invalid UTF-8"
+                    ) from exc
         elif kind == "dlp_normalize":
             value = _dlp_normalize(value)
         elif kind == "lowercase":
@@ -480,8 +555,15 @@ def _apply_recipe(recipe: dict[str, Any], source: bytes) -> bytes:
             except ValueError as exc:
                 raise ProvenanceError("view_reproduction", "hex decode failed") from exc
             if decoded.hex() != value:
-                raise ProvenanceError("view_reproduction", "non-canonical hex")
-            value = decoded.decode("utf-8", "strict")
+                raise ProvenanceError(
+                    "view_reproduction", "hex decode: non-canonical encoding"
+                )
+            try:
+                value = decoded.decode("utf-8", "strict")
+            except UnicodeDecodeError as exc:
+                raise ProvenanceError(
+                    "view_reproduction", "hex decode output: invalid UTF-8"
+                ) from exc
         elif kind in {"base32_decode", "base64_decode"}:
             padding = bool(raw.get("decode_padding", False))
             try:
@@ -512,10 +594,22 @@ def _apply_recipe(recipe: dict[str, Any], source: bytes) -> bytes:
                         else base64.b64encode(decoded).decode("ascii").rstrip("=")
                     )
             except (binascii.Error, ValueError) as exc:
-                raise ProvenanceError("view_reproduction", f"{kind} failed") from exc
+                label = kind.removesuffix("_decode").replace("base", "base")
+                raise ProvenanceError(
+                    "view_reproduction", f"{label} decode failed"
+                ) from exc
             if encoded != value:
-                raise ProvenanceError("view_reproduction", f"non-canonical {kind}")
-            value = decoded.decode("utf-8", "strict")
+                label = kind.removesuffix("_decode")
+                raise ProvenanceError(
+                    "view_reproduction", f"{label} decode: non-canonical encoding"
+                )
+            try:
+                value = decoded.decode("utf-8", "strict")
+            except UnicodeDecodeError as exc:
+                label = kind.removesuffix("_decode")
+                raise ProvenanceError(
+                    "view_reproduction", f"{label} decode output: invalid UTF-8"
+                ) from exc
         elif kind == "leetspeak":
             value = value.translate(
                 str.maketrans(
@@ -539,6 +633,34 @@ def _apply_recipe(recipe: dict[str, Any], source: bytes) -> bytes:
                 "view_reproduction", "view exceeds profile byte limit"
             )
     return value.encode("utf-8", "strict")
+
+
+def _validate_intervals(view: bytes, matches: list[tuple[int, int]]) -> None:
+    """Validate the proof profile's byte-coordinate interval invariants."""
+    try:
+        view.decode("utf-8", "strict")
+    except UnicodeDecodeError as exc:
+        raise ProvenanceError("location", "view: invalid UTF-8") from exc
+    previous_start = previous_end = -1
+    for start, end in matches:
+        if end <= start:
+            raise ProvenanceError(
+                "location", "byte end must be greater than byte start"
+            )
+        if end > len(view):
+            raise ProvenanceError("location", "interval out of bounds")
+        if (start != 0 and view[start] & 0xC0 == 0x80) or (
+            end != len(view) and view[end] & 0xC0 == 0x80
+        ):
+            raise ProvenanceError("location", "interval splits UTF-8 code point")
+        if previous_start >= 0:
+            if start < previous_start:
+                raise ProvenanceError("location", "intervals are unsorted")
+            if start == previous_start:
+                raise ProvenanceError("location", "duplicate interval start")
+            if start < previous_end:
+                raise ProvenanceError("location", "intervals overlap")
+        previous_start, previous_end = start, end
 
 
 def _commit(key: bytes, domain: str, parts: Iterable[bytes]) -> str:

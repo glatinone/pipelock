@@ -3,9 +3,15 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import * as ed25519 from "@noble/ed25519";
 import test from "node:test";
-import { verifyProvenanceFixture } from "../src/provenance.js";
+import { RawNumber, parseJSONStrict } from "../src/aarp/strictjson.js";
+import {
+  executeProvenanceRecipe,
+  validateProvenanceIntervals,
+  verifyProvenanceFixture,
+} from "../src/provenance.js";
 
 const profileDigest = "sha256:8bc27d5d89e4e5ba3e0d1e68a25a3f0170f9a5ea2f19edf81a9a90bf82e23b3e";
 const commitment = `hmac-sha256:${"0".repeat(64)}`;
@@ -208,4 +214,115 @@ test("a missing source cannot hide an available sibling reconstruction mismatch"
   assert.equal(report.failure_stage, "view_reproduction");
   assert.equal(report.view_reproduction, "mismatch");
   assert.equal(report.overall, "invalid");
+});
+
+type RawObject = Record<string, unknown>;
+
+function rawObject(value: unknown, label: string): RawObject {
+  assert.equal(typeof value, "object", `${label} must be an object`);
+  assert.notEqual(value, null, `${label} must not be null`);
+  assert.equal(Array.isArray(value), false, `${label} must not be an array`);
+  return value as RawObject;
+}
+
+function rawString(value: unknown, label: string): string {
+  assert.equal(typeof value, "string", `${label} must be a string`);
+  return value as string;
+}
+
+function rawUint(value: unknown, label: string): bigint {
+  assert.ok(value instanceof RawNumber, `${label} must preserve its JSON number literal`);
+  return BigInt(value.literal);
+}
+
+test("PR3 transform corpus executes every recipe vector byte-exactly", () => {
+  const corpusPath = "../../conformance/testdata/transform-profile/evidence-provenance-v1.json";
+  const corpus = rawObject(parseJSONStrict(readFileSync(corpusPath, "utf8")), "corpus");
+  const profile = rawString(corpus.profile_digest, "profile_digest");
+  const vectors = corpus.vectors as unknown[];
+  assert.equal(vectors.length, 29, "the pinned PR3 transform corpus must not shrink");
+  for (const value of vectors) {
+    const vector = rawObject(value, "vector");
+    const id = rawString(vector.id, "vector.id");
+    const recipe = {
+      transform_profile_digest:
+        vector.transform_profile_digest === undefined
+          ? profile
+          : rawString(vector.transform_profile_digest, `${id}.transform_profile_digest`),
+      operations: vector.recipe ?? [],
+    };
+    const input = Buffer.from(rawString(vector.input_b64, `${id}.input_b64`), "base64");
+    const wantError =
+      vector.want_error === undefined ? "" : rawString(vector.want_error, `${id}.want_error`);
+    if (wantError !== "") {
+      assert.throws(
+        () => executeProvenanceRecipe(recipe, input),
+        (error: unknown) => error instanceof Error && error.message.includes(wantError),
+        id,
+      );
+      continue;
+    }
+    const got = executeProvenanceRecipe(recipe, input);
+    assert.deepEqual(
+      got,
+      Buffer.from(rawString(vector.output_b64, `${id}.output_b64`), "base64"),
+      id,
+    );
+  }
+});
+
+test("PR3 interval vectors reject malformed UTF-8 boundaries without replacement", () => {
+  const corpusPath = "../../conformance/testdata/transform-profile/evidence-provenance-v1.json";
+  const corpus = rawObject(parseJSONStrict(readFileSync(corpusPath, "utf8")), "corpus");
+  const vectors = corpus.interval_vectors as unknown[];
+  assert.equal(vectors.length, 8, "the pinned PR3 interval corpus must not shrink");
+  for (const value of vectors) {
+    const vector = rawObject(value, "interval vector");
+    const id = rawString(vector.id, "interval id");
+    const intervals = (vector.matches as unknown[]).map((pair) => {
+      assert.ok(Array.isArray(pair) && pair.length === 2, `${id}: interval pair`);
+      return [rawUint(pair[0], `${id}.start`), rawUint(pair[1], `${id}.end`)] as const;
+    });
+    const view = Buffer.from(rawString(vector.view_b64, `${id}.view_b64`), "base64");
+    const wantError = rawString(vector.want_error, `${id}.want_error`);
+    if (wantError === "") {
+      assert.doesNotThrow(() => validateProvenanceIntervals(view, intervals), id);
+    } else {
+      assert.throws(
+        () => validateProvenanceIntervals(view, intervals),
+        (error: unknown) => error instanceof Error && error.message.includes(wantError),
+        id,
+      );
+    }
+  }
+  assert.throws(
+    () => validateProvenanceIntervals(Buffer.from([0xff]), [[0n, 1n]]),
+    /invalid UTF-8/u,
+  );
+});
+
+test("dlp_normalize implements every profile confusable mapping and range", () => {
+  const profilePath =
+    "../../conformance/testdata/transform-profile/evidence-provenance-transform-v1.json";
+  const profileJSON = JSON.parse(readFileSync(profilePath, "utf8")) as {
+    normalization: {
+      dlp_normalize: { confusable_to_ascii: { single_code_points: Record<string, string> } };
+    };
+  };
+  const map = profileJSON.normalization.dlp_normalize.confusable_to_ascii.single_code_points;
+  const singles = Object.entries(map);
+  const input = [
+    ...singles.map(([code]) => String.fromCodePoint(Number.parseInt(code.slice(2), 16))),
+    ...Array.from({ length: 26 }, (_, index) => String.fromCodePoint(0x1f170 + index)),
+    ...Array.from({ length: 26 }, (_, index) => String.fromCodePoint(0x1f1e6 + index)),
+  ].join("");
+  const want = `${singles.map(([, output]) => output).join("")}ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZ`;
+  const got = executeProvenanceRecipe(
+    {
+      transform_profile_digest: profileDigest,
+      operations: [{ kind: "dlp_normalize", profile: "pipelock-dlp-v1" }],
+    },
+    Buffer.from(input, "utf8"),
+  );
+  assert.equal(got.toString("utf8"), want);
 });
