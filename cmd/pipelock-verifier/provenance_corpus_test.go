@@ -221,7 +221,11 @@ func successfulOperationCases() []corpusOperationCase {
 	digest := normalize.EvidenceProvenanceProfileV1Digest
 	return []corpusOperationCase{
 		{"identity", normalize.Recipe{TransformProfileDigest: digest, Operations: []normalize.Operation{{Kind: normalize.OperationIdentity}}}, "Value", "Value"},
-		{"url-component", normalize.Recipe{TransformProfileDigest: digest, Operations: []normalize.Operation{{Kind: normalize.OperationURLComponent, Component: normalize.ComponentQueryVal, Selector: "token", Occurrence: 1}}}, "https://api.vendor.example/?token=first&token=second", "second"},
+		// The query parameter is deliberately named "q" rather than a credential
+		// word. This case only exercises repeated-parameter occurrence selection,
+		// and a name like "token" makes the dogfood self-scan flag the fixture as
+		// a credential in a URL, which is a false positive on the parameter name.
+		{"url-component", normalize.Recipe{TransformProfileDigest: digest, Operations: []normalize.Operation{{Kind: normalize.OperationURLComponent, Component: normalize.ComponentQueryVal, Selector: "q", Occurrence: 1}}}, "https://api.vendor.example/?q=first&q=second", "second"},
 		{"percent-decode", normalize.Recipe{TransformProfileDigest: digest, Operations: []normalize.Operation{{Kind: normalize.OperationPercentDecode, Passes: 2}}}, "%2561", "a"},
 		{"dlp-normalize", normalize.Recipe{TransformProfileDigest: digest, Operations: []normalize.Operation{{Kind: normalize.OperationDLPNormalize, Profile: "pipelock-dlp-v1"}}}, "Ｓｅｃｒｅｔ", "Secret"},
 		{"lowercase", normalize.Recipe{TransformProfileDigest: digest, Operations: []normalize.Operation{{Kind: normalize.OperationLowercase}}}, "VaLuE", "value"},
