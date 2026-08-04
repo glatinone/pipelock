@@ -175,3 +175,37 @@ test("provenance fixture reports an absent source as incomplete", async () => {
     },
   );
 });
+
+test("artifact mismatch outranks a distinct unavailable artifact", async () => {
+  const proof = signed();
+  const producer = (proof.proof as { producer: Record<string, string> }).producer;
+  const binary = Buffer.from("matching binary");
+  producer.binary_digest = `sha256:${createHash("sha256").update(binary).digest("hex")}`;
+  producer.ruleset_digest = `sha256:${"a".repeat(64)}`;
+  const value = JSON.parse(await fixture([proof])) as { verification: Record<string, unknown> };
+  value.verification.binary_b64 = binary.toString("base64");
+  value.verification.ruleset_b64 = Buffer.from("wrong ruleset").toString("base64");
+  const report = await verifyProvenanceFixture(JSON.stringify(value));
+  assert.equal(report.failure_stage, "artifacts");
+  assert.equal(report.artifacts, "mismatch");
+});
+
+test("a missing source cannot hide an available sibling reconstruction mismatch", async () => {
+  const proof = signed();
+  const sources = (proof.proof as { sources: Array<Record<string, unknown>> }).sources;
+  sources[0]!.recipe = {
+    transform_profile_digest: profileDigest,
+    operations: [{ kind: "percent_decode", passes: 1 }],
+  };
+  sources.push({
+    source_ordinal: 2,
+    source_id: "source-2",
+    recipe: { transform_profile_digest: profileDigest, operations: [{ kind: "identity" }] },
+    view_commitment: commitment,
+    matches: [],
+  });
+  const report = await verifyProvenanceFixture(await fixture([proof], { source: "%ff" }));
+  assert.equal(report.failure_stage, "view_reproduction");
+  assert.equal(report.view_reproduction, "mismatch");
+  assert.equal(report.overall, "invalid");
+});

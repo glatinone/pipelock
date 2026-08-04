@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -184,11 +185,13 @@ func verifyProvenanceFixture(fixture provenanceFixture) provenanceStageReport {
 	if len(sources) == 0 {
 		return report
 	}
+	sourceUnavailable := false
 	for _, signed := range signedProofs {
 		for _, source := range signed.Proof.Sources {
 			input, ok := sources[source.SourceID]
 			if !ok {
-				return report
+				sourceUnavailable = true
+				continue
 			}
 			view, err := source.Recipe.Apply(input)
 			if err != nil {
@@ -202,8 +205,13 @@ func verifyProvenanceFixture(fixture provenanceFixture) provenanceStageReport {
 			}
 		}
 	}
-	report.ViewReproduction = "reproduced"
-	report.Location = "exact_coordinates"
+	if !sourceUnavailable {
+		report.ViewReproduction = "reproduced"
+		report.Location = "exact_coordinates"
+	} else {
+		report.ViewReproduction = "not_checked"
+		report.Location = "not_checked"
+	}
 
 	if fixture.Verification.CommitmentKeyHex == "" {
 		return report
@@ -214,7 +222,11 @@ func verifyProvenanceFixture(fixture provenanceFixture) provenanceStageReport {
 	}
 	for _, signed := range signedProofs {
 		for _, source := range signed.Proof.Sources {
-			view, err := source.Recipe.Apply(sources[source.SourceID])
+			input, ok := sources[source.SourceID]
+			if !ok {
+				continue
+			}
+			view, err := source.Recipe.Apply(input)
 			if err != nil {
 				report.ViewReproduction = "mismatch"
 				return rejectProvenance(report, "view_reproduction")
@@ -233,11 +245,15 @@ func verifyProvenanceFixture(fixture provenanceFixture) provenanceStageReport {
 			}
 		}
 	}
+	if sourceUnavailable {
+		return report
+	}
 	report.MatchCommitment = "opened"
 	return report
 }
 
 func verifyProvenanceArtifacts(proofs []signedProvenanceProof, inputs provenanceVerificationInputs) (string, error) {
+	unchecked := false
 	for _, signed := range proofs {
 		for _, artifact := range []struct {
 			attested *string
@@ -247,7 +263,8 @@ func verifyProvenanceArtifacts(proofs []signedProvenanceProof, inputs provenance
 				continue
 			}
 			if artifact.encoded == nil {
-				return "attested_unchecked", nil
+				unchecked = true
+				continue
 			}
 			data, err := base64.StdEncoding.Strict().DecodeString(*artifact.encoded)
 			if err != nil {
@@ -258,6 +275,9 @@ func verifyProvenanceArtifacts(proofs []signedProvenanceProof, inputs provenance
 				return "mismatch", errors.New("artifact digest mismatch")
 			}
 		}
+	}
+	if unchecked {
+		return "attested_unchecked", nil
 	}
 	return "matched", nil
 }
@@ -311,7 +331,7 @@ func decodePrefixedHex(value, prefix string, size int) ([]byte, error) {
 }
 
 func hmacStringEqual(left, right string) bool {
-	return len(left) == len(right) && bytes.Equal([]byte(left), []byte(right))
+	return len(left) == len(right) && hmac.Equal([]byte(left), []byte(right))
 }
 
 func decodeStrictJSON(data []byte, destination any) error {

@@ -205,6 +205,7 @@ fn verify_entries(
         .map_err(|_| "signer key length".to_string())?;
     let verifying =
         VerifyingKey::from_bytes(&verifying).map_err(|err| format!("signer key: {err}"))?;
+    let mut missing_source = false;
     for entry in entries {
         let signature_hex = entry
             .value
@@ -273,6 +274,7 @@ fn verify_entries(
         }
         for source in &proof.sources {
             let Some(raw) = input.sources.get(&source.source_id) else {
+                missing_source = true;
                 report.view_reproduction = "not_checked".into();
                 report.location = "not_checked".into();
                 report.match_commitment = "not_checked".into();
@@ -314,6 +316,13 @@ fn verify_entries(
                     // Reproduction means the typed recipe ran and coordinates
                     // address that view. A view HMAC is a separate opening
                     // claim, so do not misreport this as failed reproduction.
+                    if missing_source {
+                        // Aggregate stages are only positive when every
+                        // source can be reproduced. Still surface the later
+                        // HMAC failure so a missing sibling cannot mask it.
+                        report.view_reproduction = "not_checked".into();
+                        report.location = "not_checked".into();
+                    }
                     report.match_commitment = "mismatch".into();
                     report.fail("view_commitment");
                     return Ok(report);
@@ -671,16 +680,19 @@ fn verify_artifacts(proof: &Proof, input: &VerificationInput) -> Stage {
         (proof.producer.ruleset.as_deref(), input.ruleset.as_deref()),
     ];
     let mut unchecked = false;
+    let mut mismatch = false;
     for (claim, bytes) in checks {
         if let Some(claim) = claim {
             match bytes {
                 Some(bytes) if claim == format!("sha256:{}", sha256_hex(bytes)) => {}
-                Some(_) => return Stage::Mismatch,
+                Some(_) => mismatch = true,
                 None => unchecked = true,
             }
         }
     }
-    if unchecked {
+    if mismatch {
+        Stage::Mismatch
+    } else if unchecked {
         Stage::Unchecked
     } else {
         Stage::Matched
@@ -1244,5 +1256,92 @@ mod tests {
         assert_eq!(report.view_reproduction, "reproduced");
         assert_eq!(report.location, "mismatch");
         assert_eq!(report.failure_stage.as_deref(), Some("location"));
+    }
+
+    #[test]
+    fn artifact_mismatch_outranks_a_missing_sibling_artifact() {
+        let signing = SigningKey::from_bytes(&[10; 32]);
+        let signed = json!({
+            "chain_seq": 0,
+            "chain_prev_hash": "genesis",
+            "critical_features": ["evidence_provenance"],
+            "proof": {
+                "version": PROOF_VERSION,
+                "transform_profile_digest": PROFILE_DIGEST,
+                "sources": [],
+                "producer": {
+                    "binary_digest": format!("sha256:{}", sha256_hex(b"binary")),
+                    "ruleset_digest": format!("sha256:{}", sha256_hex(b"expected-rules"))
+                }
+            }
+        });
+        let bytes = serde_json::to_vec(&signed).unwrap();
+        let fixture = json!({
+            "format": FIXTURE_FORMAT,
+            "entries": [{
+                "signed_b64": STANDARD.encode(&bytes),
+                "signature": format!("ed25519:{}", hex::encode(signing.sign(&bytes).to_bytes()))
+            }],
+            "verification": {
+                "signer_public_key_hex": hex::encode(signing.verifying_key().to_bytes()),
+                "ruleset_b64": STANDARD.encode("wrong-rules")
+            }
+        });
+        let report = verify_fixture_bytes(&serde_json::to_vec(&fixture).unwrap()).unwrap();
+        assert_eq!(report.artifacts, "mismatch");
+        assert_eq!(report.failure_stage.as_deref(), Some("artifacts"));
+    }
+
+    #[test]
+    fn later_available_source_still_invalidates_after_missing_source() {
+        let signing = SigningKey::from_bytes(&[11; 32]);
+        let commitment_key = vec![5; 32];
+        let source = |ordinal: u64, id: &str, commitment: String| {
+            json!({
+                "source_ordinal": ordinal,
+                "source_id": id,
+                "recipe": {"transform_profile_digest": PROFILE_DIGEST, "operations": [{"kind":"identity"}]},
+                "view_commitment": commitment,
+                "matches": [{
+                    "match_ordinal": 0,
+                    "byte_start": 0,
+                    "byte_end": 5,
+                    "match_class": "credential",
+                    "match_commitment": format!("hmac-sha256:{}", "0".repeat(64))
+                }]
+            })
+        };
+        let signed = json!({
+            "chain_seq": 0,
+            "chain_prev_hash": "genesis",
+            "critical_features": ["evidence_provenance"],
+            "proof": {
+                "version": PROOF_VERSION,
+                "transform_profile_digest": PROFILE_DIGEST,
+                "producer": {},
+                "sources": [
+                    source(0, "missing", format!("hmac-sha256:{}", "0".repeat(64))),
+                    source(1, "available", format!("hmac-sha256:{}", "0".repeat(64)))
+                ]
+            }
+        });
+        let bytes = serde_json::to_vec(&signed).unwrap();
+        let fixture = json!({
+            "format": FIXTURE_FORMAT,
+            "entries": [{
+                "signed_b64": STANDARD.encode(&bytes),
+                "signature": format!("ed25519:{}", hex::encode(signing.sign(&bytes).to_bytes()))
+            }],
+            "verification": {
+                "signer_public_key_hex": hex::encode(signing.verifying_key().to_bytes()),
+                "commitment_key_hex": hex::encode(commitment_key),
+                "sources": [{"source_id":"available", "bytes_b64": STANDARD.encode("value")}]
+            }
+        });
+        let report = verify_fixture_bytes(&serde_json::to_vec(&fixture).unwrap()).unwrap();
+        assert_eq!(report.view_reproduction, "not_checked");
+        assert_eq!(report.location, "not_checked");
+        assert_eq!(report.match_commitment, "mismatch");
+        assert_eq!(report.failure_stage.as_deref(), Some("view_commitment"));
     }
 }

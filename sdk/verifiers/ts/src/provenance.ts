@@ -824,12 +824,14 @@ function artifacts(proof: Proof, fixture: Fixture): ArtifactStage {
     [proof.producer.ruleset_digest, fixture.ruleset],
   ];
   let unchecked = false;
+  let mismatch = false;
   for (const [attested, supplied] of pairs) {
     if (attested === undefined) continue;
     if (supplied === undefined) unchecked = true;
     else if (`sha256:${createHash("sha256").update(supplied).digest("hex")}` !== attested)
-      return "mismatch";
+      mismatch = true;
   }
+  if (mismatch) return "mismatch";
   return unchecked ? "attested_unchecked" : "matched";
 }
 
@@ -888,21 +890,18 @@ export async function verifyProvenanceFixture(data: string): Promise<ProvenanceR
     for (const source of entry.proof.sources)
       allSources.push({ source, raw: fixture.sources.get(source.source_id) });
   }
-  if (allSources.some((item) => item.raw === undefined)) {
-    report.view_reproduction = "not_checked";
-    report.location = "not_checked";
-    report.match_commitment = "not_checked";
-    report.overall = "incomplete";
-    return report;
-  }
+  const missingSource = allSources.some((item) => item.raw === undefined);
+  const availableSources = allSources.filter(
+    (item): item is { source: Source; raw: string; view?: string } => item.raw !== undefined,
+  );
   try {
-    for (const item of allSources) item.view = applyRecipe(item.source.recipe, item.raw!);
+    for (const item of availableSources) item.view = applyRecipe(item.source.recipe, item.raw);
   } catch {
     report.view_reproduction = "mismatch";
     return invalid("view_reproduction", report);
   }
-  report.view_reproduction = "reproduced";
-  for (const item of allSources) {
+  if (availableSources.length > 0) report.view_reproduction = "reproduced";
+  for (const item of availableSources) {
     const bytes = Buffer.from(item.view!, "utf8");
     for (const match of item.source.matches) {
       if (
@@ -915,27 +914,44 @@ export async function verifyProvenanceFixture(data: string): Promise<ProvenanceR
       }
     }
   }
-  report.location = "exact_coordinates";
+  if (availableSources.length > 0) report.location = "exact_coordinates";
   if (fixture.commitmentKey === undefined) {
     report.match_commitment = "not_checked";
+    if (missingSource) {
+      report.view_reproduction = "not_checked";
+      report.location = "not_checked";
+    }
     report.overall = "incomplete";
     return report;
   }
-  for (const item of allSources) {
+  for (const item of availableSources) {
     if (
       commitView(fixture.commitmentKey, item.source, item.view!) !== item.source.view_commitment
     ) {
+      if (missingSource) {
+        report.view_reproduction = "not_checked";
+        report.location = "not_checked";
+      }
       report.match_commitment = "mismatch";
       return invalid("view_commitment", report);
     }
     for (const match of item.source.matches) {
       if (commitMatch(fixture.commitmentKey, item.source, match) !== match.match_commitment) {
+        if (missingSource) {
+          report.view_reproduction = "not_checked";
+          report.location = "not_checked";
+        }
         report.match_commitment = "mismatch";
         return invalid("match_commitment", report);
       }
     }
   }
-  report.match_commitment = "opened";
+  report.match_commitment = availableSources.length > 0 ? "opened" : "not_checked";
+  if (missingSource) {
+    report.view_reproduction = "not_checked";
+    report.location = "not_checked";
+    report.match_commitment = "not_checked";
+  }
   // PR3 contains no source-commitment field. Its explicit unavailable state is
   // load-bearing: it prevents fixture support from being misreported as a fully
   // opened provenance proof.

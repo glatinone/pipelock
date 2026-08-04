@@ -44,8 +44,8 @@ func TestCommittedProvenanceCorpusCoverageAndKnownAnswers(t *testing.T) {
 			t.Fatalf("%s lacks exact expected staged output: %v", base, err)
 		}
 	}
-	if caseCount != 53 || operationCount != len(normalize.SupportedOperationKinds()) || propertyCount != 16 {
-		t.Fatalf("corpus counts = cases %d operations %d properties %d; want 53, %d, 16", caseCount, operationCount, propertyCount, len(normalize.SupportedOperationKinds()))
+	if caseCount != 55 || operationCount != len(normalize.SupportedOperationKinds()) || propertyCount != 16 {
+		t.Fatalf("corpus counts = cases %d operations %d properties %d; want 55, %d, 16", caseCount, operationCount, propertyCount, len(normalize.SupportedOperationKinds()))
 	}
 
 	data, err := os.ReadFile(filepath.Join(dir, "p00-valid.json"))
@@ -161,6 +161,34 @@ func TestGenerateProvenanceCorpus(t *testing.T) {
 	artifactUnchecked := cloneCorpusFixture(t, artifacts)
 	artifactUnchecked.Verification.BinaryB64 = nil
 	writeProvenanceCase(t, dir, "p25-artifact-unchecked", artifactUnchecked)
+	artifactMismatchAfterUnavailable := cloneCorpusFixture(t, artifacts)
+	artifactMismatchAfterUnavailable.Verification.BinaryB64 = nil
+	artifactMismatchAfterUnavailable.Verification.RulesetB64 = stringRef(base64.StdEncoding.EncodeToString([]byte("wrong")))
+	writeProvenanceCase(t, dir, "p26-artifact-mismatch-after-unavailable", artifactMismatchAfterUnavailable)
+
+	sourceMismatchAfterUnavailable := cloneCorpusFixture(t, baseline)
+	mutateCorpusFixture(t, &sourceMismatchAfterUnavailable, func(s *signedProvenanceProof, f *provenanceFixture) {
+		commitmentKey := sha256.Sum256([]byte("pipelock-provenance-fixture-commitment-key-v1"))
+		input := "second-view"
+		second := s.Proof.Sources[0]
+		second.SourceOrdinal = 2
+		second.SourceID = "second-source"
+		second.Matches = nil
+		var err error
+		second.ViewCommitment, err = contractreceipt.CommitView(commitmentKey[:], second, input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		match := contractreceipt.ProvenanceMatch{MatchOrdinal: 1, ByteStart: 0, ByteEnd: 6, MatchClass: "credential"}
+		match.MatchCommitment, err = contractreceipt.CommitMatch(commitmentKey[:], second.SourceID, second.Recipe, second.ViewCommitment, match)
+		if err != nil {
+			t.Fatal(err)
+		}
+		second.Matches = []contractreceipt.ProvenanceMatch{match}
+		s.Proof.Sources = append(s.Proof.Sources, second)
+		f.Verification.Sources = []provenanceFixtureSource{{SourceID: second.SourceID, BytesB64: base64.StdEncoding.EncodeToString([]byte("second-viex"))}}
+	})
+	writeProvenanceCase(t, dir, "p27-source-mismatch-after-unavailable", sourceMismatchAfterUnavailable)
 
 	operationCases := successfulOperationCases()
 	for index, operationCase := range operationCases {

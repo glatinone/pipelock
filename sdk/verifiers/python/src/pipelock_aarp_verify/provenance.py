@@ -740,20 +740,25 @@ def _verify_entry(
             _digest(ruleset_digest, "ruleset digest")
     except ProvenanceError:
         return _invalid("proof_structure", result)
+    binary_mismatch = (
+        binary_digest is not None
+        and binary is not None
+        and binary_digest != "sha256:" + hashlib.sha256(binary).hexdigest()
+    )
+    ruleset_mismatch = (
+        ruleset_digest is not None
+        and ruleset is not None
+        and ruleset_digest != "sha256:" + hashlib.sha256(ruleset).hexdigest()
+    )
+    if binary_mismatch or ruleset_mismatch:
+        return _invalid("artifacts", result)
     if (binary_digest is not None and binary is None) or (
         ruleset_digest is not None and ruleset is None
     ):
         result["artifacts"] = "attested_unchecked"
-    elif (
-        binary_digest is not None
-        and binary_digest != "sha256:" + hashlib.sha256(binary).hexdigest()
-    ) or (
-        ruleset_digest is not None
-        and ruleset_digest != "sha256:" + hashlib.sha256(ruleset).hexdigest()
-    ):
-        return _invalid("artifacts", result)
     else:
         result["artifacts"] = "matched"
+    unavailable_source = False
     for (
         ordinal,
         source_id,
@@ -764,6 +769,7 @@ def _verify_entry(
     ) in parsed_sources:
         source = sources.get(source_id)
         if source is None:
+            unavailable_source = True
             continue
         try:
             view = _apply_recipe(recipe, source)
@@ -791,6 +797,9 @@ def _verify_entry(
                 ],
             )
             if not hmac.compare_digest(computed_view, view_commitment):
+                if unavailable_source:
+                    result["view_reproduction"] = "not_checked"
+                    result["location"] = "not_checked"
                 return _invalid("view_commitment", result)
             for match_ordinal, start, end, match_class, match_commitment in matches:
                 computed_match = _commit(
@@ -808,8 +817,17 @@ def _verify_entry(
                     ],
                 )
                 if not hmac.compare_digest(computed_match, match_commitment):
+                    if unavailable_source:
+                        result["view_reproduction"] = "not_checked"
+                        result["location"] = "not_checked"
                     return _invalid("match_commitment", result)
             result["match_commitment"] = "opened"
+    if unavailable_source:
+        # A missing source leaves the receipt incomplete, but does not prevent
+        # us from detecting a mismatch in a later source that is available.
+        result["view_reproduction"] = "not_checked"
+        result["location"] = "not_checked"
+        result["match_commitment"] = "not_checked"
     return result
 
 
