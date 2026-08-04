@@ -44,8 +44,8 @@ func TestCommittedProvenanceCorpusCoverageAndKnownAnswers(t *testing.T) {
 			t.Fatalf("%s lacks exact expected staged output: %v", base, err)
 		}
 	}
-	if caseCount != 55 || operationCount != len(normalize.SupportedOperationKinds()) || propertyCount != 16 {
-		t.Fatalf("corpus counts = cases %d operations %d properties %d; want 55, %d, 16", caseCount, operationCount, propertyCount, len(normalize.SupportedOperationKinds()))
+	if caseCount != 56 || operationCount != len(normalize.SupportedOperationKinds()) || propertyCount != 16 {
+		t.Fatalf("corpus counts = cases %d operations %d properties %d; want 56, %d, 16", caseCount, operationCount, propertyCount, len(normalize.SupportedOperationKinds()))
 	}
 
 	data, err := os.ReadFile(filepath.Join(dir, "p00-valid.json"))
@@ -99,6 +99,9 @@ func TestGenerateProvenanceCorpus(t *testing.T) {
 		mutate func(*signedProvenanceProof, *provenanceFixture)
 	}{
 		{"p03-chain-sequence", func(s *signedProvenanceProof, _ *provenanceFixture) { s.ChainSeq = 1 }},
+		{"p03b-chain-previous-hash", func(s *signedProvenanceProof, _ *provenanceFixture) {
+			s.ChainPrevHash = "sha256:" + repeatHexByte(0, sha256.Size)
+		}},
 		{"p04-critical-missing", func(s *signedProvenanceProof, _ *provenanceFixture) { s.CriticalFeatures = nil }},
 		{"p05-critical-unknown", func(s *signedProvenanceProof, _ *provenanceFixture) { s.CriticalFeatures = []string{"unknown"} }},
 		{"p06-critical-duplicate", func(s *signedProvenanceProof, _ *provenanceFixture) {
