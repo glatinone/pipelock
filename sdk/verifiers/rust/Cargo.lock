@@ -241,9 +241,9 @@ dependencies = [
 
 [[package]]
 name = "data-encoding"
-version = "2.11.0"
+version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
+checksum = "2a2330da5de22e8a3cb63252ce2abb30116bf5265e89c0e01bc17015ce30a476"
 
 [[package]]
 name = "der"
@@ -899,6 +899,7 @@ name = "pipelock-verifier-rs"
 version = "0.2.0"
 dependencies = [
  "base64",
+ "data-encoding",
  "ed25519-dalek",
  "hex",
  "jsonschema",
@@ -909,6 +910,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror",
  "unicode-normalization",
+ "url",
  "x509-parser",
 ]
 

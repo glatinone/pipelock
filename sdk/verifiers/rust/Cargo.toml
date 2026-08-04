@@ -22,6 +22,7 @@ path = "src/main.rs"
 
 [dependencies]
 base64 = "=0.22.1"
+data-encoding = "=2.9.0"
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
 hex = "=0.4.3"
 jsonschema = { version = "=0.18.3", default-features = false, features = ["draft202012"] }
@@ -34,4 +35,5 @@ thiserror = "=2.0.18"
 # NFC normalization to match Go's golang.org/x/text/unicode/norm in the AARP
 # JCS canonicalizer (byte-for-byte cross-language parity on string/key values).
 unicode-normalization = "=0.1.25"
+url = "=2.5.8"
 x509-parser = { version = "=0.18.1", default-features = false }

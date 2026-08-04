@@ -1,0 +1,19 @@
+{
+  "format": "pipelock-evidence-provenance-verification-fixture/v1",
+  "entries": [
+    {
+      "signed_b64": "eyJjaGFpbl9zZXEiOjAsImNoYWluX3ByZXZfaGFzaCI6ImdlbmVzaXMiLCJjcml0aWNhbF9mZWF0dXJlcyI6bnVsbCwicHJvb2YiOnsidmVyc2lvbiI6InBpcGVsb2NrLWV2aWRlbmNlLXByb3ZlbmFuY2UtcHJvb2YvdjEiLCJ0cmFuc2Zvcm1fcHJvZmlsZV9kaWdlc3QiOiJzaGEyNTY6OGJjMjdkNWQ4OWU0ZTViYTNlMGQxZTY4YTI1YTNmMDE3MGY5YTVlYTJmMTllZGY4MWE5YTkwYmY4MmUyM2IzZSIsInNvdXJjZXMiOlt7InNvdXJjZV9vcmRpbmFsIjoxLCJzb3VyY2VfaWQiOiJmaXh0dXJlLXNvdXJjZSIsInJlY2lwZSI6eyJ0cmFuc2Zvcm1fcHJvZmlsZV9kaWdlc3QiOiJzaGEyNTY6OGJjMjdkNWQ4OWU0ZTViYTNlMGQxZTY4YTI1YTNmMDE3MGY5YTVlYTJmMTllZGY4MWE5YTkwYmY4MmUyM2IzZSIsIm9wZXJhdGlvbnMiOlt7ImtpbmQiOiJpZGVudGl0eSJ9XX0sInZpZXdfY29tbWl0bWVudCI6ImhtYWMtc2hhMjU2OmY0NjBhYzYyYmZmMjEyMDVkMmE2NTAzOTcxMWNmMDZiODBmMjEwNzM1Yzk3ZTBmY2IwODFjNjViNjY1ODY2MzEiLCJtYXRjaGVzIjpbeyJtYXRjaF9vcmRpbmFsIjoxLCJieXRlX3N0YXJ0IjoxLCJieXRlX2VuZCI6NSwibWF0Y2hfY2xhc3MiOiJjcmVkZW50aWFsIiwibWF0Y2hfY29tbWl0bWVudCI6ImhtYWMtc2hhMjU2Ojc5OTJmODE1Njk4MmE2NTg4YTZmMjZkZGFkYzlhZGQzM2Q4ZWYxYmUxYjhjMGRjODZiMjM0OTAzOGNkYzg3MGUifV19XSwicHJvZHVjZXIiOnt9fX0=",
+      "signature": "ed25519:7a9418ddb9b6ed5c6a755c3bfec0e127eb4be45946f7b771f2897621e2ea5cc55520c8edcae791fe761a78bb9ef86078b9b6eb05ee112a2311cc59f320d1f909"
+    }
+  ],
+  "verification": {
+    "signer_public_key_hex": "89a528d021049eed05009635ff169f9cefc37bbeb6c60b75540ec5bc27ae7c86",
+    "commitment_key_hex": "006eb1caabcd702674235b58a16ec2983661f8f0a1cb17e024d5142e047b2a84",
+    "sources": [
+      {
+        "source_id": "fixture-source",
+        "bytes_b64": "QfCfkqlC"
+      }
+    ]
+  }
+}

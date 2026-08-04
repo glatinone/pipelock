@@ -1,0 +1,10 @@
+{
+  "signature": "verified",
+  "chain": "verified",
+  "artifacts": "matched",
+  "source_commitment": "not_checked",
+  "view_reproduction": "not_checked",
+  "location": "not_checked",
+  "match_commitment": "not_checked",
+  "overall": "incomplete"
+}
