@@ -830,6 +830,10 @@ def _verify_entry(
                 end = _uint(match["byte_end"], "byte end")
                 match_class = _require_str(match["match_class"], "match class")
                 _utf8(match_class, "match class")
+                if match_class == "":
+                    raise ProvenanceError(
+                        "proof_structure", "match class is required"
+                    )
                 match_commitment = _digest(
                     match["match_commitment"], "match commitment", "hmac-sha256:"
                 )
@@ -910,7 +914,7 @@ def _verify_entry(
             _validate_intervals(view, [(match[1], match[2]) for match in matches])
         except ProvenanceError:
             return _invalid("location", result)
-        for _match_ordinal, _start, _end, _match_class, _match_commitment in matches:
+        if matches:
             result["location"] = "exact_coordinates"
         if commitment_key is not None:
             computed_view = _commit(

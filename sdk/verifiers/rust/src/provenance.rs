@@ -538,6 +538,9 @@ fn parse_proof(value: &Value) -> std::result::Result<Proof, String> {
             let start = u64_value(matched, "byte_start", "match")?;
             let end = u64_value(matched, "byte_end", "match")?;
             let class = string(matched, "match_class", "match")?.to_string();
+            if class.is_empty() {
+                return Err("match: class is required".into());
+            }
             let commitment = string(matched, "match_commitment", "match")?.to_string();
             valid_digest(&commitment, "hmac-sha256:")?;
             if prior_match_ordinal.is_some_and(|prior| ordinal <= prior) {
@@ -1373,6 +1376,41 @@ mod tests {
     }
 
     #[test]
+    fn interval_corpus_exercises_structural_rules_without_a_view() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../conformance/testdata/transform-profile/evidence-provenance-v1.json"
+        );
+        let corpus: TransformCorpus =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            corpus.interval_vectors.len(),
+            8,
+            "interval vector count changed"
+        );
+        for vector in corpus.interval_vectors {
+            if matches!(vector.want_error.as_str(), "splits UTF-8" | "out of bounds") {
+                continue;
+            }
+            let result = validate_intervals(
+                None,
+                vector.matches.iter().map(|bounds| (bounds[0], bounds[1])),
+            );
+            if vector.want_error.is_empty() {
+                result.unwrap();
+            } else {
+                let error = result.expect_err(&vector.id);
+                assert!(
+                    error.contains(&vector.want_error),
+                    "{} error={error:?} want={:?}",
+                    vector.id,
+                    vector.want_error
+                );
+            }
+        }
+    }
+
+    #[test]
     fn valid_fixture_is_incomplete_without_commitment_key() {
         let signing = SigningKey::from_bytes(&[7; 32]);
         let signed = json!({"chain_seq":0,"chain_prev_hash":"genesis","critical_features":["evidence_provenance"],"proof":{"version":PROOF_VERSION,"transform_profile_digest":PROFILE_DIGEST,"sources":[],"producer":{}}});
@@ -1383,6 +1421,16 @@ mod tests {
         assert_eq!(report.chain, "verified");
         assert_eq!(report.overall, "incomplete");
         assert_eq!(serde_json::to_string(&report).unwrap(),"{\"trust_roots\":\"fixture supplied; self-attested; not authenticated\",\"authenticated_provenance\":false,\"signature\":\"verified\",\"chain\":\"verified\",\"artifacts\":\"matched\",\"source_commitment\":\"not_checked\",\"view_reproduction\":\"not_checked\",\"location\":\"not_checked\",\"match_commitment\":\"not_checked\",\"overall\":\"incomplete\"}");
+    }
+
+    #[test]
+    fn empty_match_class_fixture_fails_at_proof_structure() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../conformance/testdata/provenance/p34-empty-match-class.json"
+        );
+        let report = verify_fixture_bytes(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(report.failure_stage.as_deref(), Some("proof_structure"));
     }
 
     #[test]

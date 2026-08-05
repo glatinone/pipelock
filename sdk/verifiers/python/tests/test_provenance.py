@@ -46,6 +46,7 @@ def _fixture(
     missing_first_source_with_bad_second: bool = False,
     overflow_occurrence: bool = False,
     duplicate_chain_seq: bool = False,
+    match_class: str = "credential",
 ) -> bytes:
     key = bytes(range(32))
     source = "A💩B".encode()
@@ -77,7 +78,7 @@ def _fixture(
             (1).to_bytes(8, "big"),
             span[0].to_bytes(8, "big"),
             span[1].to_bytes(8, "big"),
-            b"credential",
+            match_class.encode(),
         ],
     )
     proof_sources = [
@@ -91,7 +92,7 @@ def _fixture(
                     "match_ordinal": 1,
                     "byte_start": span[0],
                     "byte_end": span[1],
-                    "match_class": "credential",
+                    "match_class": match_class,
                     "match_commitment": match_commitment,
                 }
             ],
@@ -226,6 +227,12 @@ def test_fixture_rejects_utf8_boundary_at_location_stage() -> None:
 
 def test_fixture_rejects_occurrence_above_uint32_as_proof_structure() -> None:
     output, exit_code = verify_fixture(_fixture(overflow_occurrence=True))
+    assert exit_code == 1
+    assert output["failure_stage"] == "proof_structure"
+
+
+def test_fixture_rejects_empty_match_class_as_proof_structure() -> None:
+    output, exit_code = verify_fixture(_fixture(match_class=""))
     assert exit_code == 1
     assert output["failure_stage"] == "proof_structure"
 

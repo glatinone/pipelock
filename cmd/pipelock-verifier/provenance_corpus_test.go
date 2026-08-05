@@ -6,8 +6,10 @@ package main
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -45,8 +47,11 @@ func TestCommittedProvenanceCorpusCoverageAndKnownAnswers(t *testing.T) {
 			t.Fatalf("%s lacks exact expected staged output: %v", base, err)
 		}
 	}
-	if caseCount != 62 || operationCount != len(normalize.SupportedOperationKinds()) || propertyCount != 16 {
-		t.Fatalf("corpus counts = cases %d operations %d properties %d; want 62, %d, 16", caseCount, operationCount, propertyCount, len(normalize.SupportedOperationKinds()))
+	const proofCases = 36
+	const propertyCases = 16
+	wantCases := proofCases + len(normalize.SupportedOperationKinds()) + propertyCases
+	if caseCount != wantCases || operationCount != len(normalize.SupportedOperationKinds()) || propertyCount != propertyCases {
+		t.Fatalf("corpus counts = cases %d operations %d properties %d; want %d, %d, %d", caseCount, operationCount, propertyCount, wantCases, len(normalize.SupportedOperationKinds()), propertyCases)
 	}
 
 	data, err := os.ReadFile(filepath.Join(dir, "p00-valid.json"))
@@ -69,6 +74,29 @@ func TestCommittedProvenanceCorpusCoverageAndKnownAnswers(t *testing.T) {
 	const knownMatch = "hmac-sha256:7992f8156982a6588a6f26ddadc9add33d8ef1be1b8c0dc86b2349038cdc870e"
 	if signed.Proof.Sources[0].ViewCommitment != knownView || signed.Proof.Sources[0].Matches[0].MatchCommitment != knownMatch {
 		t.Fatalf("known-answer commitments drifted: view %q match %q", signed.Proof.Sources[0].ViewCommitment, signed.Proof.Sources[0].Matches[0].MatchCommitment)
+	}
+	commitmentKey := sha256.Sum256([]byte("pipelock-provenance-fixture-commitment-key-v1"))
+	if got := corpusMatchCommitment(t, commitmentKey[:], signed.Proof.Sources[0], signed.Proof.Sources[0].Matches[0]); got != knownMatch {
+		t.Fatalf("corpus commitment helper = %q, want %q", got, knownMatch)
+	}
+
+	data, err = os.ReadFile(filepath.Join(dir, "p33-coordinate-non-positive-length.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := decodeStrictJSON(data, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = base64.StdEncoding.DecodeString(fixture.Entries[0].SignedB64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := decodeStrictJSON(raw, &signed); err != nil {
+		t.Fatal(err)
+	}
+	match := signed.Proof.Sources[0].Matches[0]
+	if got := corpusMatchCommitment(t, commitmentKey[:], signed.Proof.Sources[0], match); match.MatchCommitment != got {
+		t.Fatalf("p33 match commitment = %q, want recomputed %q", match.MatchCommitment, got)
 	}
 }
 
@@ -241,10 +269,16 @@ func TestGenerateProvenanceCorpus(t *testing.T) {
 		writeProvenanceCase(t, dir, tc.id, fixture)
 	}
 	invalidLength := cloneCorpusFixture(t, baseline)
-	mutateCorpusFixture(t, &invalidLength, func(s *signedProvenanceProof, _ *provenanceFixture) {
-		s.Proof.Sources[0].Matches[0].ByteEnd = s.Proof.Sources[0].Matches[0].ByteStart
+	replaceCorpusMatches(t, &invalidLength, []contractreceipt.ProvenanceMatch{
+		{MatchOrdinal: 1, ByteStart: 1, ByteEnd: 1, MatchClass: "credential"},
 	})
 	writeProvenanceCase(t, dir, "p33-coordinate-non-positive-length", invalidLength)
+
+	emptyMatchClass := cloneCorpusFixture(t, baseline)
+	replaceCorpusMatches(t, &emptyMatchClass, []contractreceipt.ProvenanceMatch{
+		{MatchOrdinal: 1, ByteStart: 1, ByteEnd: 5, MatchClass: ""},
+	})
+	writeProvenanceCase(t, dir, "p34-empty-match-class", emptyMatchClass)
 
 	operationCases := successfulOperationCases()
 	for index, operationCase := range operationCases {
@@ -341,14 +375,106 @@ func replaceCorpusMatches(t *testing.T, fixture *provenanceFixture, matches []co
 		commitmentKey := sha256.Sum256([]byte("pipelock-provenance-fixture-commitment-key-v1"))
 		source := &s.Proof.Sources[0]
 		for index := range matches {
-			var err error
-			matches[index].MatchCommitment, err = contractreceipt.CommitMatch(commitmentKey[:], source.SourceID, source.Recipe, source.ViewCommitment, matches[index])
-			if err != nil {
-				t.Fatal(err)
-			}
+			matches[index].MatchCommitment = corpusMatchCommitment(t, commitmentKey[:], *source, matches[index])
 		}
 		source.Matches = matches
 	})
+}
+
+func corpusMatchCommitment(t *testing.T, key []byte, source contractreceipt.ProvenanceSource, match contractreceipt.ProvenanceMatch) string {
+	t.Helper()
+	recipe := corpusRecipeBytes(t, source.Recipe)
+	mac := hmac.New(sha256.New, key)
+	for _, part := range [][]byte{
+		[]byte("pipelock/evidence-provenance/match/v1"),
+		[]byte(source.SourceID),
+		[]byte(source.Recipe.TransformProfileDigest),
+		recipe,
+		[]byte(source.ViewCommitment),
+		corpusUint64(match.MatchOrdinal),
+		corpusUint64(match.ByteStart),
+		corpusUint64(match.ByteEnd),
+		[]byte(match.MatchClass),
+	} {
+		_, _ = mac.Write(corpusFrame(part))
+	}
+	return "hmac-sha256:" + hex.EncodeToString(mac.Sum(nil))
+}
+
+func corpusRecipeBytes(t *testing.T, recipe normalize.Recipe) []byte {
+	t.Helper()
+	result := corpusFrame([]byte("pipelock/evidence-provenance/recipe/v1"))
+	result = append(result, corpusFrame([]byte(recipe.TransformProfileDigest))...)
+	result = append(result, corpusFrame(corpusUint64(uint64(len(recipe.Operations))))...)
+	for _, operation := range recipe.Operations {
+		var kind byte
+		switch operation.Kind {
+		case normalize.OperationIdentity:
+			kind = 1
+		case normalize.OperationURLComponent:
+			kind = 2
+		case normalize.OperationPercentDecode:
+			kind = 3
+		case normalize.OperationDLPNormalize:
+			kind = 4
+		case normalize.OperationLowercase:
+			kind = 5
+		case normalize.OperationInvisibleStrip:
+			kind = 6
+		case normalize.OperationHexDecode:
+			kind = 7
+		case normalize.OperationBase32Decode:
+			kind = 8
+		case normalize.OperationBase64Decode:
+			kind = 9
+		case normalize.OperationLeetspeak:
+			kind = 10
+		case normalize.OperationVowelFold:
+			kind = 11
+		default:
+			t.Fatalf("unsupported corpus operation kind %q", operation.Kind)
+		}
+		component := byte(0)
+		switch operation.Component {
+		case "":
+		case normalize.ComponentURL:
+			component = 1
+		case normalize.ComponentHostname:
+			component = 2
+		case normalize.ComponentPath:
+			component = 3
+		case normalize.ComponentQueryKey:
+			component = 4
+		case normalize.ComponentQueryVal:
+			component = 5
+		default:
+			t.Fatalf("unsupported corpus component %q", operation.Component)
+		}
+		var occurrence [4]byte
+		binary.BigEndian.PutUint32(occurrence[:], operation.Occurrence)
+		padding := byte(0)
+		if operation.DecodePadding {
+			padding = 1
+		}
+		encoded := make([]byte, 0, 64)
+		for _, part := range [][]byte{{kind}, {component}, []byte(operation.Selector), occurrence[:], {operation.Passes}, []byte(operation.Profile), {padding}} {
+			encoded = append(encoded, corpusFrame(part)...)
+		}
+		result = append(result, corpusFrame(encoded)...)
+	}
+	return result
+}
+
+func corpusFrame(value []byte) []byte {
+	result := make([]byte, 8, 8+len(value))
+	binary.BigEndian.PutUint64(result, uint64(len(value)))
+	return append(result, value...)
+}
+
+func corpusUint64(value uint64) []byte {
+	result := make([]byte, 8)
+	binary.BigEndian.PutUint64(result, value)
+	return result
 }
 
 func appendCorpusEntry(t *testing.T, fixture *provenanceFixture) {
