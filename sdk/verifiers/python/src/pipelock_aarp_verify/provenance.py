@@ -31,6 +31,7 @@ PROFILE_DIGEST = (
     "sha256:8bc27d5d89e4e5ba3e0d1e68a25a3f0170f9a5ea2f19edf81a9a90bf82e23b3e"
 )
 GENESIS = "genesis"
+TRUST_ROOTS = "fixture supplied; self-attested; not authenticated"
 _MAX_INPUT = 2 << 20
 _MAX_OUTPUT = 1 << 20
 _OP_BYTES = {
@@ -229,6 +230,10 @@ def _validate_operation(
     profile: str,
     padding: bool,
 ) -> None:
+    if occurrence > 0xFFFFFFFF:
+        raise ProvenanceError(
+            "proof_structure", "operation occurrence exceeds uint32"
+        )
     if kind not in _OP_BYTES:
         raise ProvenanceError("proof_structure", f"unknown operation {kind!r}")
     if component not in _COMPONENT_BYTES:
@@ -594,7 +599,7 @@ def _apply_recipe(recipe: dict[str, Any], source: bytes) -> bytes:
                         else base64.b64encode(decoded).decode("ascii").rstrip("=")
                     )
             except (binascii.Error, ValueError) as exc:
-                label = kind.removesuffix("_decode").replace("base", "base")
+                label = kind.removesuffix("_decode")
                 raise ProvenanceError(
                     "view_reproduction", f"{label} decode failed"
                 ) from exc
@@ -681,8 +686,10 @@ def _output(
     match_commitment: str = "not_checked",
     overall: str = "incomplete",
     failure_stage: str = "",
-) -> dict[str, str]:
+) -> dict[str, Any]:
     value = {
+        "trust_roots": TRUST_ROOTS,
+        "authenticated_provenance": False,
         "signature": signature,
         "chain": chain,
         "artifacts": artifacts,
@@ -697,7 +704,7 @@ def _output(
     return value
 
 
-def _invalid(stage: str, current: dict[str, str]) -> dict[str, str]:
+def _invalid(stage: str, current: dict[str, Any]) -> dict[str, Any]:
     if stage in current:
         current[stage] = "invalid" if stage in {"signature", "chain"} else "mismatch"
     if stage == "view_commitment":
@@ -732,11 +739,12 @@ def _verify_entry(
     binary: bytes | None,
     ruleset: bytes | None,
     previous_signed: bytes | None,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     result = _output()
     try:
         entry = _exact_dict(entry, {"signed_b64", "signature"}, "entry")
         signed = _b64(entry["signed_b64"], "signed_b64")
+        signed_object = _parse_signed(signed)
         signature = _require_str(entry["signature"], "signature")
         if not signature.startswith("ed25519:"):
             raise ValueError("signature prefix")
@@ -744,10 +752,11 @@ def _verify_entry(
             _hex(signature[8:], "signature", 64), signed
         )
         result["signature"] = "verified"
+    except ProvenanceError:
+        return _invalid("proof_structure", result)
     except (InvalidSignature, ValueError, TypeError):
         return _invalid("signature", result)
     try:
-        signed_object = _parse_signed(signed)
         sequence = _uint(signed_object["chain_seq"], "chain_seq")
         previous = _require_str(signed_object["chain_prev_hash"], "chain_prev_hash")
         expected_previous = (
@@ -953,7 +962,7 @@ def _verify_entry(
     return result
 
 
-def verify_fixture(data: bytes) -> tuple[dict[str, str], int]:
+def verify_fixture(data: bytes) -> tuple[dict[str, Any], int]:
     """Verify the fixture wrapper and return one aggregate staged report."""
     try:
         wrapper = parse_json_strict(data)
@@ -968,7 +977,11 @@ def verify_fixture(data: bytes) -> tuple[dict[str, str], int]:
             "verification",
         )
         source_inputs = verification.get("sources", [])
-        if not isinstance(entries, list) or not isinstance(source_inputs, list):
+        if (
+            not isinstance(entries, list)
+            or not entries
+            or not isinstance(source_inputs, list)
+        ):
             raise ValueError("entries and sources must be arrays")
         public_key = _hex(
             verification["signer_public_key_hex"], "signer public key", 32
@@ -998,7 +1011,7 @@ def verify_fixture(data: bytes) -> tuple[dict[str, str], int]:
             else _b64(verification["ruleset_b64"], "ruleset")
         )
     except (StrictParseError, UnicodeDecodeError, ValueError, ProvenanceError):
-        return _invalid("proof_structure", _output()), 2
+        return _invalid("proof_structure", _output()), 1
     aggregate = _output(signature="verified", chain="verified", artifacts="matched")
     all_reproduced = True
     all_located = True

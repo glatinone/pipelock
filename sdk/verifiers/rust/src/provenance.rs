@@ -9,9 +9,10 @@
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::{Signature, VerifyingKey};
+use hmac::{Hmac, Mac};
 use serde::Serialize;
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
+use sha2_10::Sha256 as HmacSha256;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -25,9 +26,12 @@ const PROOF_VERSION: &str = "pipelock-evidence-provenance-proof/v1";
 const PROFILE_DIGEST: &str =
     "sha256:8bc27d5d89e4e5ba3e0d1e68a25a3f0170f9a5ea2f19edf81a9a90bf82e23b3e";
 const GENESIS: &str = "genesis";
+const TRUST_ROOTS: &str = "fixture supplied; self-attested; not authenticated";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProvenanceReport {
+    pub trust_roots: String,
+    pub authenticated_provenance: bool,
     pub signature: String,
     pub chain: String,
     pub artifacts: String,
@@ -43,6 +47,8 @@ pub struct ProvenanceReport {
 impl ProvenanceReport {
     fn pending() -> Self {
         Self {
+            trust_roots: TRUST_ROOTS.into(),
+            authenticated_provenance: false,
             signature: "not_checked".into(),
             chain: "not_checked".into(),
             artifacts: "attested_unchecked".into(),
@@ -58,6 +64,12 @@ impl ProvenanceReport {
     fn fail(&mut self, stage: &str) {
         self.overall = "invalid".into();
         self.failure_stage = Some(stage.into());
+    }
+
+    fn proof_structure_failure() -> Self {
+        let mut report = Self::pending();
+        report.fail("proof_structure");
+        report
     }
 }
 
@@ -79,7 +91,10 @@ struct VerificationInput {
 pub fn run_provenance(path: &Path) -> Result<ProvenanceReport> {
     let bytes = fs::read(path)
         .map_err(|err| VerifierError::Runtime(format!("read {}: {err}", path.display())))?;
-    verify_fixture_bytes(&bytes).map_err(VerifierError::Runtime)
+    Ok(
+        verify_fixture_bytes(&bytes)
+            .unwrap_or_else(|_| ProvenanceReport::proof_structure_failure()),
+    )
 }
 
 /// Verify one fixture. Errors here indicate a malformed fixture envelope;
@@ -350,6 +365,11 @@ fn verify_entries(
             }
         }
     }
+    if missing_source {
+        report.view_reproduction = "not_checked".into();
+        report.location = "not_checked".into();
+        report.match_commitment = "not_checked".into();
+    }
     // PR3 has no source commitment, so authenticated proof opening remains
     // incomplete by design until that future field exists.
     report.overall = "incomplete".into();
@@ -447,8 +467,9 @@ fn parse_proof(value: &Value) -> std::result::Result<Proof, String> {
         return Err("proof: unsupported version or profile".into());
     }
     let producer_value = object(required(proof, "producer", "proof")?, "proof.producer")?;
-    exact_keys(
+    exact_keys_with_optional(
         producer_value,
+        &["binary_digest", "ruleset_digest"],
         &["binary_digest", "ruleset_digest"],
         "producer",
     )?;
@@ -1062,27 +1083,14 @@ fn component_byte(component: &str) -> std::result::Result<u8, String> {
     }
 }
 fn commitment(key: &[u8], domain: &str, parts: &[Vec<u8>]) -> String {
-    let mut inner = Sha256::new();
-    let block = 64;
-    let mut key = key.to_vec();
-    if key.len() > block {
-        key = Sha256::digest(&key).to_vec()
-    }
-    key.resize(block, 0);
-    let outer_key: Vec<u8> = key.iter().map(|b| b ^ 0x5c).collect();
-    let inner_key: Vec<u8> = key.iter().map(|b| b ^ 0x36).collect();
-    inner.update(&inner_key);
+    let mut mac = Hmac::<HmacSha256>::new_from_slice(key).expect("HMAC accepts keys of any length");
     let mut framed = Vec::new();
     frame_into(&mut framed, domain.as_bytes());
     for part in parts {
         frame_into(&mut framed, part)
     }
-    inner.update(&framed);
-    let hash = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(&outer_key);
-    outer.update(hash);
-    format!("hmac-sha256:{}", hex::encode(outer.finalize()))
+    mac.update(&framed);
+    format!("hmac-sha256:{}", hex::encode(mac.finalize().into_bytes()))
 }
 fn frame_into(out: &mut Vec<u8>, value: &[u8]) {
     out.extend_from_slice(&(value.len() as u64).to_be_bytes());
@@ -1176,18 +1184,7 @@ fn exact_keys(
     allowed: &[&str],
     label: &str,
 ) -> std::result::Result<(), String> {
-    exact_keys_with_optional(
-        object,
-        allowed,
-        &[
-            "commitment_key_hex",
-            "binary_b64",
-            "ruleset_b64",
-            "binary_digest",
-            "ruleset_digest",
-        ],
-        label,
-    )
+    exact_keys_with_optional(object, allowed, &[], label)
 }
 
 fn exact_keys_with_optional(
@@ -1383,7 +1380,7 @@ mod tests {
         assert_eq!(report.signature, "verified");
         assert_eq!(report.chain, "verified");
         assert_eq!(report.overall, "incomplete");
-        assert_eq!(serde_json::to_string(&report).unwrap(),"{\"signature\":\"verified\",\"chain\":\"verified\",\"artifacts\":\"matched\",\"source_commitment\":\"not_checked\",\"view_reproduction\":\"not_checked\",\"location\":\"not_checked\",\"match_commitment\":\"not_checked\",\"overall\":\"incomplete\"}");
+        assert_eq!(serde_json::to_string(&report).unwrap(),"{\"trust_roots\":\"fixture supplied; self-attested; not authenticated\",\"authenticated_provenance\":false,\"signature\":\"verified\",\"chain\":\"verified\",\"artifacts\":\"matched\",\"source_commitment\":\"not_checked\",\"view_reproduction\":\"not_checked\",\"location\":\"not_checked\",\"match_commitment\":\"not_checked\",\"overall\":\"incomplete\"}");
     }
 
     #[test]
@@ -1518,5 +1515,64 @@ mod tests {
         assert_eq!(report.location, "not_checked");
         assert_eq!(report.match_commitment, "mismatch");
         assert_eq!(report.failure_stage.as_deref(), Some("view_commitment"));
+    }
+
+    #[test]
+    fn missing_source_before_valid_source_downgrades_aggregate_stages() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../conformance/testdata/provenance/p28-missing-source-before-valid-source.json"
+        );
+        let report = verify_fixture_bytes(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(report.view_reproduction, "not_checked");
+        assert_eq!(report.location, "not_checked");
+        assert_eq!(report.match_commitment, "not_checked");
+        assert_eq!(report.overall, "incomplete");
+    }
+
+    #[test]
+    fn commitment_implementation_matches_frozen_known_answer() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../conformance/testdata/provenance/p00-valid.json"
+        );
+        let report = verify_fixture_bytes(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(report.match_commitment, "opened");
+        assert_eq!(report.overall, "incomplete");
+    }
+
+    #[test]
+    fn duplicate_keys_in_envelope_and_signed_payload_are_rejected() {
+        let envelope = br#"{"format":"one","format":"two","entries":[],"verification":{}}"#;
+        assert!(verify_fixture_bytes(envelope)
+            .expect_err("duplicate fixture key must fail")
+            .contains("duplicate"));
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../conformance/testdata/provenance/p29-duplicate-signed-key.json"
+        );
+        assert!(verify_fixture_bytes(&std::fs::read(path).unwrap())
+            .expect_err("duplicate signed key must fail")
+            .contains("duplicate"));
+    }
+
+    #[test]
+    fn required_fields_are_not_inferred_optional_by_name() {
+        let present = json!({"binary_digest": "value"});
+        exact_keys(
+            present.as_object().unwrap(),
+            &["binary_digest"],
+            "required field",
+        )
+        .unwrap();
+
+        let absent = json!({});
+        assert!(exact_keys(
+            absent.as_object().unwrap(),
+            &["binary_digest"],
+            "required field",
+        )
+        .is_err());
     }
 }

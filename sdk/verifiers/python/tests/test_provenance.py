@@ -44,6 +44,8 @@ def _fixture(
     producer: dict[str, str] | None = None,
     verification_artifacts: dict[str, str] | None = None,
     missing_first_source_with_bad_second: bool = False,
+    overflow_occurrence: bool = False,
+    duplicate_chain_seq: bool = False,
 ) -> bytes:
     key = bytes(range(32))
     source = "A💩B".encode()
@@ -95,6 +97,15 @@ def _fixture(
             ],
         }
     ]
+    if overflow_occurrence:
+        recipe["operations"] = [
+            {
+                "kind": "url_component",
+                "component": "query_value",
+                "selector": "q",
+                "occurrence": 1 << 32,
+            }
+        ]
     source_inputs = [
         {
             "source_id": "source",
@@ -151,6 +162,10 @@ def _fixture(
             },
             separators=(",", ":"),
         ).encode()
+        if duplicate_chain_seq:
+            signed = signed.replace(
+                b'{"chain_seq":0,', b'{"chain_seq":0,"chain_seq":0,', 1
+            )
         entries.append(
             {
                 "signed_b64": base64.b64encode(signed).decode(),
@@ -181,6 +196,8 @@ def test_fixture_verifies_available_stages_but_is_incomplete_without_source_comm
     output, exit_code = verify_fixture(_fixture())
     assert exit_code == 0
     assert output == {
+        "trust_roots": "fixture supplied; self-attested; not authenticated",
+        "authenticated_provenance": False,
         "signature": "verified",
         "chain": "verified",
         "artifacts": "matched",
@@ -205,6 +222,31 @@ def test_fixture_rejects_utf8_boundary_at_location_stage() -> None:
     assert exit_code == 1
     assert output["view_reproduction"] == "reproduced"
     assert output["failure_stage"] == "location"
+
+
+def test_fixture_rejects_occurrence_above_uint32_as_proof_structure() -> None:
+    output, exit_code = verify_fixture(_fixture(overflow_occurrence=True))
+    assert exit_code == 1
+    assert output["failure_stage"] == "proof_structure"
+
+
+def test_fixture_rejects_duplicate_keys_in_envelope_and_signed_payload() -> None:
+    envelope = _fixture().replace(
+        b'{"format":', b'{"format":"duplicate","format":', 1
+    )
+    envelope_output, envelope_exit = verify_fixture(envelope)
+    assert envelope_exit == 1
+    assert envelope_output["failure_stage"] == "proof_structure"
+
+    signed_output, signed_exit = verify_fixture(_fixture(duplicate_chain_seq=True))
+    assert signed_exit == 1
+    assert signed_output["failure_stage"] == "proof_structure"
+
+
+def test_fixture_rejects_empty_entries_as_proof_structure() -> None:
+    output, exit_code = verify_fixture(_fixture(chain_length=0))
+    assert exit_code == 1
+    assert output["failure_stage"] == "proof_structure"
 
 
 def test_fixture_checks_every_chain_entry() -> None:

@@ -146,6 +146,11 @@ for v in GO_PROVENANCE TS_PROVENANCE RUST_PROVENANCE PY_PROVENANCE; do
   fi
 done
 
+read -r -a go_provenance_cmd <<< "$GO_PROVENANCE"
+read -r -a ts_provenance_cmd <<< "$TS_PROVENANCE"
+read -r -a rust_provenance_cmd <<< "$RUST_PROVENANCE"
+read -r -a py_provenance_cmd <<< "$PY_PROVENANCE"
+
 provenance_output() { # path cmd... -> stdout, preserving invalid-stage JSON
   local path="$1"; shift
   local output
@@ -167,12 +172,12 @@ for f in "$PROVENANCE_CORPUS"/*.json; do
   base="$(basename "$f" .json)"
   expfile="$PROVENANCE_CORPUS/$base.expect.json"
   [ -f "$expfile" ] || { echo "FATAL: missing provenance expectation for $base" >&2; exit 2; }
-  expected="$(tr -d '\n ' < "$expfile")"
+  expected="$(<"$expfile")"
 
-  go="$(provenance_output "$f" $GO_PROVENANCE)" || exit 2
-  ts="$(provenance_output "$f" $TS_PROVENANCE)" || exit 2
-  rs="$(provenance_output "$f" $RUST_PROVENANCE)" || exit 2
-  py="$(provenance_output "$f" $PY_PROVENANCE)" || exit 2
+  go="$(provenance_output "$f" "${go_provenance_cmd[@]}")" || exit 2
+  ts="$(provenance_output "$f" "${ts_provenance_cmd[@]}")" || exit 2
+  rs="$(provenance_output "$f" "${rust_provenance_cmd[@]}")" || exit 2
+  py="$(provenance_output "$f" "${py_provenance_cmd[@]}")" || exit 2
   provenance_checked=$((provenance_checked + 1))
 
   result="ok"

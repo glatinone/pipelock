@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import * as ed25519 from "@noble/ed25519";
 import test from "node:test";
 import { RawNumber, parseJSONStrict } from "../src/aarp/strictjson.js";
@@ -16,6 +17,10 @@ import {
 const profileDigest = "sha256:8bc27d5d89e4e5ba3e0d1e68a25a3f0170f9a5ea2f19edf81a9a90bf82e23b3e";
 const commitment = `hmac-sha256:${"0".repeat(64)}`;
 const seed = Buffer.from("1".repeat(64), "hex");
+const corpusDir = fileURLToPath(
+  // Tests execute from dist/tests after tsc, so walk from that emitted module.
+  new URL("../../../../conformance/testdata/transform-profile/", import.meta.url),
+);
 
 async function fixture(
   signed: Record<string, unknown>[],
@@ -74,6 +79,8 @@ function signed(overrides: Record<string, unknown> = {}): Record<string, unknown
 test("provenance fixture reports all available stages and remains incomplete without source commitments", async () => {
   const report = await verifyProvenanceFixture(await fixture([signed()]));
   assert.deepEqual(report, {
+    trust_roots: "fixture supplied; self-attested; not authenticated",
+    authenticated_provenance: false,
     signature: "verified",
     chain: "verified",
     artifacts: "matched",
@@ -124,6 +131,8 @@ test("provenance fixture reports signature failure before every later stage", as
     await fixture([signed()], { corruptSignature: true }),
   );
   assert.deepEqual(report, {
+    trust_roots: "fixture supplied; self-attested; not authenticated",
+    authenticated_provenance: false,
     signature: "invalid",
     chain: "not_checked",
     artifacts: "attested_unchecked",
@@ -134,6 +143,35 @@ test("provenance fixture reports signature failure before every later stage", as
     overall: "invalid",
     failure_stage: "signature",
   });
+});
+
+test("provenance fixture rejects duplicate keys in envelopes and signed payloads", async () => {
+  const ordinary = await fixture([signed()]);
+  const duplicateEnvelope = ordinary.replace('{"format":', '{"format":"duplicate","format":');
+  const envelopeReport = await verifyProvenanceFixture(duplicateEnvelope);
+  assert.equal(envelopeReport.failure_stage, "proof_structure");
+
+  const signer = await ed25519.getPublicKeyAsync(seed);
+  const raw = Buffer.from(
+    JSON.stringify(signed()).replace('{"chain_seq":0,', '{"chain_seq":0,"chain_seq":0,'),
+  );
+  const signature = Buffer.from(await ed25519.signAsync(raw, seed));
+  const duplicateSigned = JSON.stringify({
+    format: "pipelock-evidence-provenance-verification-fixture/v1",
+    entries: [
+      {
+        signed_b64: raw.toString("base64"),
+        signature: `ed25519:${signature.toString("hex")}`,
+      },
+    ],
+    verification: {
+      signer_public_key_hex: Buffer.from(signer).toString("hex"),
+      sources: [],
+    },
+  });
+  const signedReport = await verifyProvenanceFixture(duplicateSigned);
+  assert.equal(signedReport.failure_stage, "proof_structure");
+  assert.equal(signedReport.signature, "not_checked");
 });
 
 test("provenance fixture verifies every entry in a signed chain", async () => {
@@ -236,7 +274,7 @@ function rawUint(value: unknown, label: string): bigint {
 }
 
 test("PR3 transform corpus executes every recipe vector byte-exactly", () => {
-  const corpusPath = "../../conformance/testdata/transform-profile/evidence-provenance-v1.json";
+  const corpusPath = `${corpusDir}evidence-provenance-v1.json`;
   const corpus = rawObject(parseJSONStrict(readFileSync(corpusPath, "utf8")), "corpus");
   const profile = rawString(corpus.profile_digest, "profile_digest");
   const vectors = corpus.vectors as unknown[];
@@ -272,7 +310,7 @@ test("PR3 transform corpus executes every recipe vector byte-exactly", () => {
 });
 
 test("PR3 interval vectors reject malformed UTF-8 boundaries without replacement", () => {
-  const corpusPath = "../../conformance/testdata/transform-profile/evidence-provenance-v1.json";
+  const corpusPath = `${corpusDir}evidence-provenance-v1.json`;
   const corpus = rawObject(parseJSONStrict(readFileSync(corpusPath, "utf8")), "corpus");
   const vectors = corpus.interval_vectors as unknown[];
   assert.equal(vectors.length, 8, "the pinned PR3 interval corpus must not shrink");
@@ -302,8 +340,7 @@ test("PR3 interval vectors reject malformed UTF-8 boundaries without replacement
 });
 
 test("dlp_normalize implements every profile confusable mapping and range", () => {
-  const profilePath =
-    "../../conformance/testdata/transform-profile/evidence-provenance-transform-v1.json";
+  const profilePath = `${corpusDir}evidence-provenance-transform-v1.json`;
   const profileJSON = JSON.parse(readFileSync(profilePath, "utf8")) as {
     normalization: {
       dlp_normalize: { confusable_to_ascii: { single_code_points: Record<string, string> } };

@@ -14,6 +14,7 @@ export const provenanceFixtureFormat = "pipelock-evidence-provenance-verificatio
 const proofVersion = "pipelock-evidence-provenance-proof/v1";
 const profileDigest = "sha256:8bc27d5d89e4e5ba3e0d1e68a25a3f0170f9a5ea2f19edf81a9a90bf82e23b3e";
 const knownFeature = "evidence_provenance";
+const trustRoots = "fixture supplied; self-attested; not authenticated";
 const maxInputBytes = 2 << 20;
 const maxOutputBytes = 1 << 20;
 
@@ -36,6 +37,8 @@ export type FailureStage =
   | "match_commitment";
 
 export interface ProvenanceReport {
+  trust_roots: typeof trustRoots;
+  authenticated_provenance: false;
   signature: SignatureStage;
   chain: ChainStage;
   artifacts: ArtifactStage;
@@ -361,6 +364,8 @@ function parseFixture(data: string): Fixture {
 
 function stage(failure?: FailureStage): ProvenanceReport {
   return {
+    trust_roots: trustRoots,
+    authenticated_provenance: false,
     signature: failure === "signature" ? "invalid" : "not_checked",
     chain: "not_checked",
     artifacts: "attested_unchecked",
@@ -1112,6 +1117,8 @@ export async function runProvenanceFixture(path: string): Promise<ProvenanceRepo
 
 export function comparableProvenance(report: ProvenanceReport): string {
   const ordered: ProvenanceReport = {
+    trust_roots: report.trust_roots,
+    authenticated_provenance: report.authenticated_provenance,
     signature: report.signature,
     chain: report.chain,
     artifacts: report.artifacts,

@@ -27,6 +27,7 @@ import (
 const (
 	provenanceFixtureFormat = "pipelock-evidence-provenance-verification-fixture/v1"
 	provenanceFeature       = "evidence_provenance"
+	provenanceTrustRoots    = "fixture supplied; self-attested; not authenticated"
 )
 
 type provenanceFixture struct {
@@ -61,53 +62,77 @@ type signedProvenanceProof struct {
 }
 
 type provenanceStageReport struct {
-	Signature        string `json:"signature"`
-	Chain            string `json:"chain"`
-	Artifacts        string `json:"artifacts"`
-	SourceCommitment string `json:"source_commitment"`
-	ViewReproduction string `json:"view_reproduction"`
-	Location         string `json:"location"`
-	MatchCommitment  string `json:"match_commitment"`
-	Overall          string `json:"overall"`
-	FailureStage     string `json:"failure_stage,omitempty"`
+	TrustRoots              string `json:"trust_roots"`
+	AuthenticatedProvenance bool   `json:"authenticated_provenance"`
+	Signature               string `json:"signature"`
+	Chain                   string `json:"chain"`
+	Artifacts               string `json:"artifacts"`
+	SourceCommitment        string `json:"source_commitment"`
+	ViewReproduction        string `json:"view_reproduction"`
+	Location                string `json:"location"`
+	MatchCommitment         string `json:"match_commitment"`
+	Overall                 string `json:"overall"`
+	FailureStage            string `json:"failure_stage,omitempty"`
 }
 
 func newProvenanceCmd() *cobra.Command {
-	return &cobra.Command{
+	var allowIncomplete bool
+	cmd := &cobra.Command{
 		Use:           "provenance PATH",
 		Short:         "Verify an experimental evidence-provenance fixture",
 		Args:          exactOneArg,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runProvenance(cmd.OutOrStdout(), args[0])
+			return runProvenance(cmd.OutOrStdout(), args[0], allowIncomplete)
 		},
 	}
+	cmd.Flags().BoolVar(&allowIncomplete, "allow-incomplete", false, "return success for an incomplete fixture inspection")
+	return cmd
 }
 
-func runProvenance(stdout io.Writer, path string) error {
+func runProvenance(stdout io.Writer, path string, allowIncomplete bool) error {
 	data, err := os.ReadFile(path) // #nosec G304 -- explicit CLI input
 	if err != nil {
 		return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("read provenance fixture: %w", err))
 	}
 	var fixture provenanceFixture
 	if err := decodeStrictJSON(data, &fixture); err != nil {
-		return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("decode provenance fixture: %w", err))
+		report := rejectProvenance(initialProvenanceReport(), "proof_structure")
+		if writeErr := writeProvenanceReport(stdout, report); writeErr != nil {
+			return writeErr
+		}
+		return cliutil.ExitCodeError(cliutil.ExitGeneral, fmt.Errorf("decode provenance fixture: %w", err))
 	}
 	report := verifyProvenanceFixture(fixture)
+	if err := writeProvenanceReport(stdout, report); err != nil {
+		return err
+	}
+	switch report.Overall {
+	case "verified":
+		return nil
+	case "incomplete":
+		if allowIncomplete {
+			return nil
+		}
+		return cliutil.ExitCodeError(cliutil.ExitGeneral, errors.New("provenance fixture verification is incomplete; pass --allow-incomplete for inspection-only use"))
+	default:
+		return cliutil.ExitCodeError(cliutil.ExitGeneral, fmt.Errorf("provenance fixture rejected at %s", report.FailureStage))
+	}
+}
+
+func writeProvenanceReport(stdout io.Writer, report provenanceStageReport) error {
 	encoded, err := json.Marshal(report)
 	if err != nil {
 		return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("encode provenance report: %w", err))
 	}
 	_, _ = fmt.Fprintf(stdout, "%s\n", encoded)
-	if report.Overall == "invalid" {
-		return cliutil.ExitCodeError(cliutil.ExitGeneral, fmt.Errorf("provenance fixture rejected at %s", report.FailureStage))
-	}
 	return nil
 }
 
 func initialProvenanceReport() provenanceStageReport {
 	return provenanceStageReport{
+		TrustRoots: provenanceTrustRoots, AuthenticatedProvenance: false,
 		Signature: "not_checked", Chain: "not_checked", Artifacts: "attested_unchecked",
 		SourceCommitment: "not_checked", ViewReproduction: "not_checked", Location: "not_checked",
 		MatchCommitment: "not_checked", Overall: "incomplete",
@@ -123,7 +148,7 @@ func rejectProvenance(report provenanceStageReport, stage string) provenanceStag
 func verifyProvenanceFixture(fixture provenanceFixture) provenanceStageReport {
 	report := initialProvenanceReport()
 	if fixture.Format != provenanceFixtureFormat || len(fixture.Entries) == 0 {
-		return rejectProvenance(report, "fixture_structure")
+		return rejectProvenance(report, "proof_structure")
 	}
 	publicKey, err := hex.DecodeString(fixture.Verification.SignerPublicKeyHex)
 	if err != nil || len(publicKey) != ed25519.PublicKeySize {
@@ -136,12 +161,15 @@ func verifyProvenanceFixture(fixture provenanceFixture) provenanceStageReport {
 	for _, entry := range fixture.Entries {
 		raw, decodeErr := base64.StdEncoding.Strict().DecodeString(entry.SignedB64)
 		sig, sigErr := decodePrefixedHex(entry.Signature, "ed25519:", ed25519.SignatureSize)
-		if decodeErr != nil || !utf8.Valid(raw) || sigErr != nil || !ed25519.Verify(publicKey, raw, sig) {
+		if decodeErr != nil || !utf8.Valid(raw) || sigErr != nil {
 			report.Signature = "invalid"
 			return rejectProvenance(report, "signature")
 		}
 		var signed signedProvenanceProof
 		if err := decodeStrictJSON(raw, &signed); err != nil {
+			return rejectProvenance(report, "proof_structure")
+		}
+		if !ed25519.Verify(publicKey, raw, sig) {
 			report.Signature = "invalid"
 			return rejectProvenance(report, "signature")
 		}
@@ -180,14 +208,16 @@ func verifyProvenanceFixture(fixture provenanceFixture) provenanceStageReport {
 
 	sources, err := provenanceSources(fixture.Verification.Sources)
 	if err != nil {
-		return rejectProvenance(report, "fixture_structure")
+		return rejectProvenance(report, "proof_structure")
 	}
 	if len(sources) == 0 {
 		return report
 	}
 	sourceUnavailable := false
+	sourceVisited := false
 	for _, signed := range signedProofs {
 		for _, source := range signed.Proof.Sources {
+			sourceVisited = true
 			input, ok := sources[source.SourceID]
 			if !ok {
 				sourceUnavailable = true
@@ -205,7 +235,7 @@ func verifyProvenanceFixture(fixture provenanceFixture) provenanceStageReport {
 			}
 		}
 	}
-	if !sourceUnavailable {
+	if sourceVisited && !sourceUnavailable {
 		report.ViewReproduction = "reproduced"
 		report.Location = "exact_coordinates"
 	} else {
@@ -218,7 +248,7 @@ func verifyProvenanceFixture(fixture provenanceFixture) provenanceStageReport {
 	}
 	commitmentKey, err := hex.DecodeString(fixture.Verification.CommitmentKeyHex)
 	if err != nil || len(commitmentKey) < sha256.Size {
-		return rejectProvenance(report, "fixture_structure")
+		return rejectProvenance(report, "proof_structure")
 	}
 	for _, signed := range signedProofs {
 		for _, source := range signed.Proof.Sources {
@@ -245,7 +275,7 @@ func verifyProvenanceFixture(fixture provenanceFixture) provenanceStageReport {
 			}
 		}
 	}
-	if sourceUnavailable {
+	if sourceUnavailable || !sourceVisited {
 		return report
 	}
 	report.MatchCommitment = "opened"
@@ -335,6 +365,9 @@ func hmacStringEqual(left, right string) bool {
 }
 
 func decodeStrictJSON(data []byte, destination any) error {
+	if err := rejectDuplicateJSONKeys(data); err != nil {
+		return err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(destination); err != nil {
@@ -348,4 +381,63 @@ func decodeStrictJSON(data []byte, destination any) error {
 		return fmt.Errorf("decode trailing JSON: %w", err)
 	}
 	return nil
+}
+
+func rejectDuplicateJSONKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := scanJSONValue(decoder); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("found trailing JSON value")
+		}
+		return fmt.Errorf("decode trailing JSON: %w", err)
+	}
+	return nil
+}
+
+func scanJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return errors.New("JSON object key is not a string")
+			}
+			if _, exists := seen[key]; exists {
+				return fmt.Errorf("duplicate JSON object key %q", key)
+			}
+			seen[key] = struct{}{}
+			if err := scanJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		_, err = decoder.Token()
+		return err
+	case '[':
+		for decoder.More() {
+			if err := scanJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		_, err = decoder.Token()
+		return err
+	default:
+		return fmt.Errorf("unexpected JSON delimiter %q", delim)
+	}
 }

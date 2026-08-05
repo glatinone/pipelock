@@ -24,6 +24,31 @@ func TestVerifyProvenanceFixtureStages(t *testing.T) {
 	}
 }
 
+func TestProvenanceReportDisclosesFixtureSuppliedTrustRoots(t *testing.T) {
+	report := verifyProvenanceFixture(validProvenanceFixture(t, "view", 0, 4))
+	if report.TrustRoots != "fixture supplied; self-attested; not authenticated" {
+		t.Fatalf("trust_roots = %q", report.TrustRoots)
+	}
+}
+
+func TestProvenanceReportNeverClaimsAuthenticatedProvenance(t *testing.T) {
+	report := verifyProvenanceFixture(validProvenanceFixture(t, "view", 0, 4))
+	if report.AuthenticatedProvenance {
+		t.Fatal("fixture-supplied trust roots were reported as authenticated provenance")
+	}
+}
+
+func TestVerifyProvenanceFixtureDoesNotOpenAbsentProofSources(t *testing.T) {
+	fixture := validProvenanceFixture(t, "view", 0, 4)
+	resignProvenanceFixture(t, &fixture, func(signed *signedProvenanceProof) {
+		signed.Proof.Sources = nil
+	})
+	report := verifyProvenanceFixture(fixture)
+	if report.ViewReproduction != "not_checked" || report.Location != "not_checked" || report.MatchCommitment != "not_checked" {
+		t.Fatalf("report = %+v", report)
+	}
+}
+
 func TestVerifyProvenanceFixtureRejectsCriticalFeature(t *testing.T) {
 	fixture := validProvenanceFixture(t, "view", 0, 4)
 	resignProvenanceFixture(t, &fixture, func(signed *signedProvenanceProof) {
@@ -78,8 +103,7 @@ func TestVerifyProvenanceFixtureChecksSignatureBeforeSemantics(t *testing.T) {
 
 func validProvenanceFixture(t *testing.T, input string, start, end uint64) provenanceFixture {
 	t.Helper()
-	seed := sha256.Sum256([]byte("pipelock-provenance-fixture-signing-key-v1"))
-	privateKey := ed25519.NewKeyFromSeed(seed[:])
+	privateKey := provenanceFixtureSigningKey()
 	publicKey := privateKey.Public().(ed25519.PublicKey)
 	commitmentKey := sha256.Sum256([]byte("pipelock-provenance-fixture-commitment-key-v1"))
 	recipe := normalize.Recipe{TransformProfileDigest: normalize.EvidenceProvenanceProfileV1Digest, Operations: []normalize.Operation{{Kind: normalize.OperationIdentity}}}
@@ -127,7 +151,11 @@ func resignProvenanceFixture(t *testing.T, fixture *provenanceFixture, mutate fu
 	if err != nil {
 		t.Fatal(err)
 	}
-	seed := sha256.Sum256([]byte("pipelock-provenance-fixture-signing-key-v1"))
-	privateKey := ed25519.NewKeyFromSeed(seed[:])
+	privateKey := provenanceFixtureSigningKey()
 	fixture.Entries[0] = provenanceFixtureEntry{SignedB64: base64.StdEncoding.EncodeToString(raw), Signature: "ed25519:" + hex.EncodeToString(ed25519.Sign(privateKey, raw))}
+}
+
+func provenanceFixtureSigningKey() ed25519.PrivateKey {
+	seed := sha256.Sum256([]byte("pipelock-provenance-fixture-signing-key-v1"))
+	return ed25519.NewKeyFromSeed(seed[:])
 }
