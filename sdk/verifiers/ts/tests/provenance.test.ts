@@ -3,7 +3,8 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as ed25519 from "@noble/ed25519";
 import test from "node:test";
@@ -17,9 +18,20 @@ import {
 const profileDigest = "sha256:8bc27d5d89e4e5ba3e0d1e68a25a3f0170f9a5ea2f19edf81a9a90bf82e23b3e";
 const commitment = `hmac-sha256:${"0".repeat(64)}`;
 const seed = Buffer.from("1".repeat(64), "hex");
-const corpusDir = fileURLToPath(
-  // Tests execute from dist/tests after tsc, so walk from that emitted module.
-  new URL("../../../../conformance/testdata/transform-profile/", import.meta.url),
+
+function findPackageRoot(moduleURL: string): string {
+  let current = dirname(fileURLToPath(moduleURL));
+  for (;;) {
+    if (existsSync(resolve(current, "package.json"))) return current;
+    const parent = dirname(current);
+    if (parent === current) throw new Error("TypeScript verifier package root not found");
+    current = parent;
+  }
+}
+
+const corpusDir = resolve(
+  findPackageRoot(import.meta.url),
+  "../../conformance/testdata/transform-profile",
 );
 
 async function fixture(
@@ -274,7 +286,7 @@ function rawUint(value: unknown, label: string): bigint {
 }
 
 test("PR3 transform corpus executes every recipe vector byte-exactly", () => {
-  const corpusPath = `${corpusDir}evidence-provenance-v1.json`;
+  const corpusPath = resolve(corpusDir, "evidence-provenance-v1.json");
   const corpus = rawObject(parseJSONStrict(readFileSync(corpusPath, "utf8")), "corpus");
   const profile = rawString(corpus.profile_digest, "profile_digest");
   const vectors = corpus.vectors as unknown[];
@@ -310,7 +322,7 @@ test("PR3 transform corpus executes every recipe vector byte-exactly", () => {
 });
 
 test("PR3 interval vectors reject malformed UTF-8 boundaries without replacement", () => {
-  const corpusPath = `${corpusDir}evidence-provenance-v1.json`;
+  const corpusPath = resolve(corpusDir, "evidence-provenance-v1.json");
   const corpus = rawObject(parseJSONStrict(readFileSync(corpusPath, "utf8")), "corpus");
   const vectors = corpus.interval_vectors as unknown[];
   assert.equal(vectors.length, 8, "the pinned PR3 interval corpus must not shrink");
@@ -340,7 +352,7 @@ test("PR3 interval vectors reject malformed UTF-8 boundaries without replacement
 });
 
 test("dlp_normalize implements every profile confusable mapping and range", () => {
-  const profilePath = `${corpusDir}evidence-provenance-transform-v1.json`;
+  const profilePath = resolve(corpusDir, "evidence-provenance-transform-v1.json");
   const profileJSON = JSON.parse(readFileSync(profilePath, "utf8")) as {
     normalization: {
       dlp_normalize: { confusable_to_ascii: { single_code_points: Record<string, string> } };
