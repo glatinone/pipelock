@@ -305,12 +305,20 @@ fn verify_entries(
                 }
             };
             report.view_reproduction = "reproduced".into();
+            if validate_intervals(
+                Some(&view),
+                source
+                    .matches
+                    .iter()
+                    .map(|matched| (matched.start, matched.end)),
+            )
+            .is_err()
+            {
+                report.location = "mismatch".into();
+                report.fail("location");
+                return Ok(report);
+            }
             for matched in &source.matches {
-                if !byte_interval_valid(&view, matched.start, matched.end) {
-                    report.location = "mismatch".into();
-                    report.fail("location");
-                    return Ok(report);
-                }
                 report.location = "exact_coordinates".into();
                 let Some(key) = input.commitment_key.as_deref() else {
                     report.match_commitment = "not_checked".into();
@@ -512,7 +520,7 @@ fn parse_proof(value: &Value) -> std::result::Result<Proof, String> {
         let commitment = string(source, "view_commitment", "proof source")?.to_string();
         valid_digest(&commitment, "hmac-sha256:")?;
         let mut matches = Vec::new();
-        let mut prior_match = None;
+        let mut prior_match_ordinal = None;
         for value in array(required(source, "matches", "proof source")?, "matches")? {
             let matched = object(value, "match")?;
             exact_keys(
@@ -532,14 +540,10 @@ fn parse_proof(value: &Value) -> std::result::Result<Proof, String> {
             let class = string(matched, "match_class", "match")?.to_string();
             let commitment = string(matched, "match_commitment", "match")?.to_string();
             valid_digest(&commitment, "hmac-sha256:")?;
-            if end <= start
-                || prior_match.is_some_and(|(prior_ordinal, prior_start, prior_end)| {
-                    ordinal <= prior_ordinal || start <= prior_start || start < prior_end
-                })
-            {
-                return Err("match: invalid order or interval".into());
+            if prior_match_ordinal.is_some_and(|prior| ordinal <= prior) {
+                return Err("match: invalid ordinal order".into());
             }
-            prior_match = Some((ordinal, start, end));
+            prior_match_ordinal = Some(ordinal);
             matches.push(ProofMatch {
                 ordinal,
                 start,
@@ -548,6 +552,10 @@ fn parse_proof(value: &Value) -> std::result::Result<Proof, String> {
                 commitment,
             });
         }
+        validate_intervals(
+            None,
+            matches.iter().map(|matched| (matched.start, matched.end)),
+        )?;
         sources.push(ProofSource {
             source_ordinal: ordinal,
             source_id: id,
@@ -1099,16 +1107,39 @@ fn frame_into(out: &mut Vec<u8>, value: &[u8]) {
 fn u64_bytes(value: u64) -> Vec<u8> {
     value.to_be_bytes().to_vec()
 }
-fn byte_interval_valid(view: &str, start: u64, end: u64) -> bool {
-    end > start
-        && end <= view.len() as u64
-        && (start == 0
-            || (start < view.len() as u64 && view.as_bytes()[start as usize] & 0xc0 != 0x80))
-        && (end == view.len() as u64
-            || (end < view.len() as u64 && view.as_bytes()[end as usize] & 0xc0 != 0x80))
+fn validate_intervals<I>(view: Option<&str>, intervals: I) -> std::result::Result<(), String>
+where
+    I: IntoIterator<Item = (u64, u64)>,
+{
+    let mut previous = None;
+    for (start, end) in intervals {
+        if end <= start {
+            return Err("byte end must be greater".into());
+        }
+        if let Some(view) = view {
+            if end > view.len() as u64 {
+                return Err("out of bounds".into());
+            }
+            if !byte_boundary(view, start) || !byte_boundary(view, end) {
+                return Err("splits UTF-8".into());
+            }
+        }
+        if let Some((previous_start, previous_end)) = previous {
+            if start < previous_start {
+                return Err("unsorted".into());
+            }
+            if start == previous_start {
+                return Err("duplicate".into());
+            }
+            if start < previous_end {
+                return Err("overlap".into());
+            }
+        }
+        previous = Some((start, end));
+    }
+    Ok(())
 }
 
-#[cfg(test)]
 fn byte_boundary(view: &str, offset: u64) -> bool {
     offset == 0
         || offset == view.len() as u64
@@ -1323,7 +1354,10 @@ mod tests {
         );
         for vector in corpus.interval_vectors {
             let view = String::from_utf8(STANDARD.decode(&vector.view_b64).unwrap()).unwrap();
-            let result = validate_interval_corpus_vector(&view, &vector.matches);
+            let result = validate_intervals(
+                Some(&view),
+                vector.matches.iter().map(|bounds| (bounds[0], bounds[1])),
+            );
             if vector.want_error.is_empty() {
                 result.unwrap();
             } else {
@@ -1336,38 +1370,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    fn validate_interval_corpus_vector(
-        view: &str,
-        matches: &[[u64; 2]],
-    ) -> std::result::Result<(), String> {
-        let mut previous: Option<[u64; 2]> = None;
-        for bounds in matches {
-            let [start, end] = *bounds;
-            if end <= start {
-                return Err("byte end must be greater".into());
-            }
-            if end > view.len() as u64 {
-                return Err("out of bounds".into());
-            }
-            if !byte_boundary(view, start) || !byte_boundary(view, end) {
-                return Err("splits UTF-8".into());
-            }
-            if let Some([previous_start, previous_end]) = previous {
-                if start < previous_start {
-                    return Err("unsorted".into());
-                }
-                if start == previous_start {
-                    return Err("duplicate".into());
-                }
-                if start < previous_end {
-                    return Err("overlap".into());
-                }
-            }
-            previous = Some([start, end]);
-        }
-        Ok(())
     }
 
     #[test]

@@ -45,8 +45,8 @@ func TestCommittedProvenanceCorpusCoverageAndKnownAnswers(t *testing.T) {
 			t.Fatalf("%s lacks exact expected staged output: %v", base, err)
 		}
 	}
-	if caseCount != 58 || operationCount != len(normalize.SupportedOperationKinds()) || propertyCount != 16 {
-		t.Fatalf("corpus counts = cases %d operations %d properties %d; want 58, %d, 16", caseCount, operationCount, propertyCount, len(normalize.SupportedOperationKinds()))
+	if caseCount != 62 || operationCount != len(normalize.SupportedOperationKinds()) || propertyCount != 16 {
+		t.Fatalf("corpus counts = cases %d operations %d properties %d; want 62, %d, 16", caseCount, operationCount, propertyCount, len(normalize.SupportedOperationKinds()))
 	}
 
 	data, err := os.ReadFile(filepath.Join(dir, "p00-valid.json"))
@@ -228,6 +228,24 @@ func TestGenerateProvenanceCorpus(t *testing.T) {
 	}
 	writeProvenanceCase(t, dir, "p29-duplicate-signed-key", duplicateSignedKey)
 
+	for _, tc := range []struct {
+		id      string
+		matches []contractreceipt.ProvenanceMatch
+	}{
+		{"p30-coordinate-overlap", []contractreceipt.ProvenanceMatch{{MatchOrdinal: 1, ByteStart: 0, ByteEnd: 3, MatchClass: "first"}, {MatchOrdinal: 2, ByteStart: 2, ByteEnd: 5, MatchClass: "second"}}},
+		{"p31-coordinate-unsorted", []contractreceipt.ProvenanceMatch{{MatchOrdinal: 1, ByteStart: 3, ByteEnd: 5, MatchClass: "first"}, {MatchOrdinal: 2, ByteStart: 0, ByteEnd: 1, MatchClass: "second"}}},
+		{"p32-coordinate-duplicate-start", []contractreceipt.ProvenanceMatch{{MatchOrdinal: 1, ByteStart: 0, ByteEnd: 1, MatchClass: "first"}, {MatchOrdinal: 2, ByteStart: 0, ByteEnd: 2, MatchClass: "second"}}},
+	} {
+		fixture := cloneCorpusFixture(t, baseline)
+		replaceCorpusMatches(t, &fixture, tc.matches)
+		writeProvenanceCase(t, dir, tc.id, fixture)
+	}
+	invalidLength := cloneCorpusFixture(t, baseline)
+	mutateCorpusFixture(t, &invalidLength, func(s *signedProvenanceProof, _ *provenanceFixture) {
+		s.Proof.Sources[0].Matches[0].ByteEnd = s.Proof.Sources[0].Matches[0].ByteStart
+	})
+	writeProvenanceCase(t, dir, "p33-coordinate-non-positive-length", invalidLength)
+
 	operationCases := successfulOperationCases()
 	for index, operationCase := range operationCases {
 		fixture := corpusFixture(t, operationCase.recipe, operationCase.input, 0, uint64(len(operationCase.output)))
@@ -315,6 +333,22 @@ func mutateCorpusFixture(t *testing.T, fixture *provenanceFixture, mutate func(*
 	seed := sha256.Sum256([]byte("pipelock-provenance-fixture-signing-key-v1"))
 	privateKey := ed25519.NewKeyFromSeed(seed[:])
 	fixture.Entries[0] = provenanceFixtureEntry{SignedB64: base64.StdEncoding.EncodeToString(raw), Signature: "ed25519:" + hex.EncodeToString(ed25519.Sign(privateKey, raw))}
+}
+
+func replaceCorpusMatches(t *testing.T, fixture *provenanceFixture, matches []contractreceipt.ProvenanceMatch) {
+	t.Helper()
+	mutateCorpusFixture(t, fixture, func(s *signedProvenanceProof, _ *provenanceFixture) {
+		commitmentKey := sha256.Sum256([]byte("pipelock-provenance-fixture-commitment-key-v1"))
+		source := &s.Proof.Sources[0]
+		for index := range matches {
+			var err error
+			matches[index].MatchCommitment, err = contractreceipt.CommitMatch(commitmentKey[:], source.SourceID, source.Recipe, source.ViewCommitment, matches[index])
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		source.Matches = matches
+	})
 }
 
 func appendCorpusEntry(t *testing.T, fixture *provenanceFixture) {

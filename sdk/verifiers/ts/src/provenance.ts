@@ -410,25 +410,16 @@ function validateProofStructure(proof: Proof): void {
     validateRecipe(source.recipe);
     digest(source.view_commitment, "hmac-sha256:", "view commitment");
     let previousOrdinal = -1n;
-    let previousStart = -1n;
-    let previousEnd = -1n;
     for (const match of source.matches) {
-      if (match.byte_end <= match.byte_start || match.match_ordinal <= previousOrdinal) {
-        throw new FixtureError("invalid match interval or ordinal");
-      }
-      if (
-        match.byte_start < previousStart ||
-        match.byte_start === previousStart ||
-        match.byte_start < previousEnd
-      ) {
-        throw new FixtureError("matches must be ordered and non-overlapping");
-      }
+      if (match.match_ordinal <= previousOrdinal) throw new FixtureError("invalid match ordinal");
       if (match.match_class === "") throw new FixtureError("match class is required");
       digest(match.match_commitment, "hmac-sha256:", "match commitment");
       previousOrdinal = match.match_ordinal;
-      previousStart = match.byte_start;
-      previousEnd = match.byte_end;
     }
+    validateProvenanceIntervals(
+      undefined,
+      source.matches.map((match) => [match.byte_start, match.byte_end] as const),
+    );
   }
 }
 
@@ -946,10 +937,10 @@ function boundary(bytes: Buffer, offset: bigint): boolean {
 }
 
 export function validateProvenanceIntervals(
-  view: Buffer,
+  view: Buffer | undefined,
   intervals: Array<readonly [bigint, bigint]>,
 ): void {
-  utf8(view, "view");
+  if (view !== undefined) utf8(view, "view");
   let previousStart = -1n;
   let previousEnd = -1n;
   for (const [start, end] of intervals) {
@@ -957,9 +948,11 @@ export function validateProvenanceIntervals(
     if (start < previousStart) throw new FixtureError("intervals are unsorted");
     if (start === previousStart) throw new FixtureError("duplicate interval start");
     if (start < previousEnd) throw new FixtureError("intervals overlap");
-    if (end > BigInt(view.length)) throw new FixtureError("interval out of bounds");
-    if (!boundary(view, start) || !boundary(view, end))
-      throw new FixtureError("interval splits UTF-8 code point");
+    if (view !== undefined) {
+      if (end > BigInt(view.length)) throw new FixtureError("interval out of bounds");
+      if (!boundary(view, start) || !boundary(view, end))
+        throw new FixtureError("interval splits UTF-8 code point");
+    }
     previousStart = start;
     previousEnd = end;
   }
@@ -1050,15 +1043,14 @@ export async function verifyProvenanceFixture(data: string): Promise<ProvenanceR
   if (availableSources.length > 0) report.view_reproduction = "reproduced";
   for (const item of availableSources) {
     const bytes = Buffer.from(item.view!, "utf8");
-    for (const match of item.source.matches) {
-      if (
-        match.byte_end > BigInt(bytes.length) ||
-        !boundary(bytes, match.byte_start) ||
-        !boundary(bytes, match.byte_end)
-      ) {
-        report.location = "mismatch";
-        return invalid("location", report);
-      }
+    try {
+      validateProvenanceIntervals(
+        bytes,
+        item.source.matches.map((match) => [match.byte_start, match.byte_end] as const),
+      );
+    } catch {
+      report.location = "mismatch";
+      return invalid("location", report);
     }
   }
   if (availableSources.length > 0) report.location = "exact_coordinates";

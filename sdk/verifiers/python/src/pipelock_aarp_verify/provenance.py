@@ -231,9 +231,7 @@ def _validate_operation(
     padding: bool,
 ) -> None:
     if occurrence > 0xFFFFFFFF:
-        raise ProvenanceError(
-            "proof_structure", "operation occurrence exceeds uint32"
-        )
+        raise ProvenanceError("proof_structure", "operation occurrence exceeds uint32")
     if kind not in _OP_BYTES:
         raise ProvenanceError("proof_structure", f"unknown operation {kind!r}")
     if component not in _COMPONENT_BYTES:
@@ -640,31 +638,36 @@ def _apply_recipe(recipe: dict[str, Any], source: bytes) -> bytes:
     return value.encode("utf-8", "strict")
 
 
-def _validate_intervals(view: bytes, matches: list[tuple[int, int]]) -> None:
+def _validate_intervals(
+    view: bytes | None,
+    matches: list[tuple[int, int]],
+    *,
+    stage: str = "location",
+) -> None:
     """Validate the proof profile's byte-coordinate interval invariants."""
-    try:
-        view.decode("utf-8", "strict")
-    except UnicodeDecodeError as exc:
-        raise ProvenanceError("location", "view: invalid UTF-8") from exc
+    if view is not None:
+        try:
+            view.decode("utf-8", "strict")
+        except UnicodeDecodeError as exc:
+            raise ProvenanceError(stage, "view: invalid UTF-8") from exc
     previous_start = previous_end = -1
     for start, end in matches:
         if end <= start:
-            raise ProvenanceError(
-                "location", "byte end must be greater than byte start"
-            )
-        if end > len(view):
-            raise ProvenanceError("location", "interval out of bounds")
-        if (start != 0 and view[start] & 0xC0 == 0x80) or (
-            end != len(view) and view[end] & 0xC0 == 0x80
-        ):
-            raise ProvenanceError("location", "interval splits UTF-8 code point")
+            raise ProvenanceError(stage, "byte end must be greater than byte start")
+        if view is not None:
+            if end > len(view):
+                raise ProvenanceError(stage, "interval out of bounds")
+            if (start != 0 and view[start] & 0xC0 == 0x80) or (
+                end != len(view) and view[end] & 0xC0 == 0x80
+            ):
+                raise ProvenanceError(stage, "interval splits UTF-8 code point")
         if previous_start >= 0:
             if start < previous_start:
-                raise ProvenanceError("location", "intervals are unsorted")
+                raise ProvenanceError(stage, "intervals are unsorted")
             if start == previous_start:
-                raise ProvenanceError("location", "duplicate interval start")
+                raise ProvenanceError(stage, "duplicate interval start")
             if start < previous_end:
-                raise ProvenanceError("location", "intervals overlap")
+                raise ProvenanceError(stage, "intervals overlap")
         previous_start, previous_end = start, end
 
 
@@ -819,7 +822,7 @@ def _verify_entry(
             if not isinstance(matches, list):
                 raise ProvenanceError("proof_structure", "matches must be an array")
             parsed_matches = []
-            previous_start = previous_end = previous_ordinal = -1
+            previous_ordinal = -1
             for match in matches:
                 match = _exact_dict(match, _MATCH_KEYS, "match")
                 match_ordinal = _uint(match["match_ordinal"], "match ordinal")
@@ -830,23 +833,19 @@ def _verify_entry(
                 match_commitment = _digest(
                     match["match_commitment"], "match commitment", "hmac-sha256:"
                 )
-                if (
-                    end <= start
-                    or match_ordinal <= previous_ordinal
-                    or start <= previous_start
-                    or start < previous_end
-                ):
+                if match_ordinal <= previous_ordinal:
                     raise ProvenanceError(
                         "proof_structure", "match ordering or interval is invalid"
                     )
                 parsed_matches.append(
                     (match_ordinal, start, end, match_class, match_commitment)
                 )
-                previous_start, previous_end, previous_ordinal = (
-                    start,
-                    end,
-                    match_ordinal,
-                )
+                previous_ordinal = match_ordinal
+            _validate_intervals(
+                None,
+                [(match[1], match[2]) for match in parsed_matches],
+                stage="proof_structure",
+            )
             parsed_sources.append(
                 (
                     ordinal,
