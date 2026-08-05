@@ -907,13 +907,11 @@ def _verify_entry(
         except (ProvenanceError, UnicodeError):
             return _invalid("view_reproduction", result)
         result["view_reproduction"] = "reproduced"
-        for _match_ordinal, start, end, _match_class, _match_commitment in matches:
-            if (
-                end > len(view)
-                or (start != 0 and view[start] & 0xC0 == 0x80)
-                or (end != len(view) and view[end] & 0xC0 == 0x80)
-            ):
-                return _invalid("location", result)
+        try:
+            _validate_intervals(view, [(match[1], match[2]) for match in matches])
+        except ProvenanceError:
+            return _invalid("location", result)
+        for _match_ordinal, _start, _end, _match_class, _match_commitment in matches:
             result["location"] = "exact_coordinates"
         if commitment_key is not None:
             computed_view = _commit(
