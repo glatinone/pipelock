@@ -945,6 +945,57 @@ def display_path(path: str) -> str:
     return text[:512] or "unspecified"
 
 
+def head_has_moved(repo: str, pr_number: str, token: str, binding: PullBinding, reviewer_sha: str) -> bool:
+    """Whether the pull request head no longer matches the reviewed commit.
+
+    A transient read failure returns False so a flaky API call cannot abandon a
+    review that is otherwise progressing; the authoritative check still runs at
+    the end, where a genuine move is recorded.
+    """
+    try:
+        return get_pull_binding(repo, pr_number, token, reviewer_sha).head_sha != binding.head_sha
+    except (FetchError, requests.RequestException):
+        return False
+
+
+def publish_progress(
+    repo: str,
+    comment_id: int,
+    token: str,
+    binding: PullBinding,
+    mode: str,
+    classification: list[str],
+    progress: ReviewProgress,
+    phase: str,
+) -> None:
+    """Advance the running status comment so a long review is visibly alive.
+
+    A deep pass legitimately runs for many minutes. Without this the comment
+    reads "pending immutable diff fetch" for the whole run, which is
+    indistinguishable from a hung job. Failures here are ignored: progress
+    reporting must never end a review that is working.
+    """
+    body = "\n".join(
+        [
+            "## AI PR Review",
+            "",
+            "**Status:** `running`",
+            f"**Command:** `{'/review deep' if mode == 'deep' else '/review'}`",
+            f"**Model:** `{model_for_mode(mode)}` (`{reasoning_for_mode(mode)}` reasoning)",
+            f"**Binding:** base `{binding.base_sha}` head `{binding.head_sha}`",
+            f"**Review identity:** `{binding.correlation}`",
+            f"**Classification:** {', '.join(classification) if classification else 'empty diff'}",
+            f"**Progress:** {phase}; {progress.reviewed_units}/{progress.expected_units} representable units reviewed.",
+            "",
+            f"<!-- {STATUS_MARKER} state=running identity={binding.correlation} -->",
+        ]
+    )
+    try:
+        update_comment(repo, comment_id, token, body, binding.correlation)
+    except (ReviewError, requests.RequestException):
+        log_phase("progress", status="update-failed", correlation=binding.correlation)
+
+
 def render_status(binding: PullBinding, mode: str, classification: list[str], progress: ReviewProgress, state: str, manifest: list[dict[str, Any]]) -> str:
     model = model_for_mode(mode)
     severity_order = {"high": 0, "medium": 1, "low": 2}
@@ -1092,7 +1143,16 @@ def run_review(
             progress.incomplete_reasons.append("one or more deletion hunks were collapsed")
         reviewed_changes: list[dict[str, str]] = []
         candidates: list[Finding] = []
+        publish_progress(repo, comment["id"], token, binding, mode, classification, progress, f"reviewing 0/{len(chunks)} chunks")
         for chunk_index, chunk in enumerate(chunks, 1):
+            # Checked before each chunk rather than only at the end. A deep pass
+            # runs for many minutes, and a head that moved early would otherwise
+            # spend the whole budget and the provider spend producing a review
+            # that can only be published as historical.
+            if head_has_moved(repo, pr_number, token, binding, reviewer_sha):
+                progress.head_changed = True
+                progress.incomplete_reasons.append("the pull request head moved while the review was running")
+                break
             if not budget_allows(deadline, mode):
                 progress.incomplete_reasons.append("wall-clock budget exhausted before every chunk was reviewed")
                 break
@@ -1111,6 +1171,9 @@ def run_review(
             progress.reviewed_units += len(chunk)
             candidates.extend(findings)
             reviewed_changes.extend(changes)
+            publish_progress(
+                repo, comment["id"], token, binding, mode, classification, progress, f"reviewing {chunk_index}/{len(chunks)} chunks"
+            )
         synthesis_ready = (
             progress.reviewed_units == progress.expected_units
             and not progress.aggregation_failed

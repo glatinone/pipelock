@@ -265,18 +265,52 @@ class ImmutableBindingTest(unittest.TestCase):
             "findings": [],
             "changes": [{"path": "internal/a.go", "summary": "changes enforcement"}],
         }
-        with mock.patch.object(pr_review, "get_pull_binding", side_effect=[original, moved]), mock.patch.object(
+        # The head moves immediately, so the run must stop before spending the
+        # provider budget on a commit whose result can only be historical.
+        with mock.patch.object(pr_review, "get_pull_binding", side_effect=[original, moved, moved]), mock.patch.object(
             pr_review, "find_running_comment", return_value=None
         ), mock.patch.object(pr_review, "create_comment", return_value={"id": 7}), mock.patch.object(
             pr_review, "fetch_bound_diff", return_value=diff
         ), mock.patch.object(
             pr_review, "call_model", side_effect=[review_payload, {"findings": []}]
-        ), mock.patch.object(pr_review, "update_comment"), mock.patch.object(
+        ) as call_model, mock.patch.object(pr_review, "update_comment"), mock.patch.object(
             pr_review, "provider_configuration", return_value=("https://provider.example/v1/chat/completions", "key")
         ), mock.patch.object(pr_review, "compare_incompleteness", return_value=None):
             state, progress = pr_review.run_review("owner/repo", "42", "token", "default", "c" * 40)
         self.assertEqual(state, "superseded")
         self.assertTrue(progress.head_changed)
+        self.assertEqual(call_model.call_count, 0, "a moved head must not spend a provider call")
+
+    def test_running_comment_advances_while_the_review_works(self) -> None:
+        # A deep pass runs for many minutes. Without an advancing comment the
+        # status is indistinguishable from a hung job, which is what made a
+        # working review look broken.
+        binding = pr_review.PullBinding("a" * 40, "b" * 40, "c" * 40, pr_review.RUBRIC_VERSION)
+        diff = "\n".join(
+            [
+                "diff --git a/internal/a.go b/internal/a.go",
+                "--- a/internal/a.go",
+                "+++ b/internal/a.go",
+                "@@ -1 +1 @@",
+                "-old",
+                "+new",
+            ]
+        )
+        payload = {"findings": [], "changes": [{"path": "internal/a.go", "summary": "changes enforcement"}]}
+        with mock.patch.object(pr_review, "get_pull_binding", return_value=binding), mock.patch.object(
+            pr_review, "find_running_comment", return_value=None
+        ), mock.patch.object(pr_review, "create_comment", return_value={"id": 7}), mock.patch.object(
+            pr_review, "fetch_bound_diff", return_value=diff
+        ), mock.patch.object(pr_review, "call_model", side_effect=[payload, {"findings": []}]), mock.patch.object(
+            pr_review, "provider_configuration", return_value=("https://provider.example/v1/chat/completions", "key")
+        ), mock.patch.object(pr_review, "compare_incompleteness", return_value=None), mock.patch.object(
+            pr_review, "update_comment"
+        ) as update:
+            pr_review.run_review("owner/repo", "42", "token", "default", "c" * 40)
+        bodies = [call.args[3] for call in update.call_args_list]
+        self.assertGreater(len(bodies), 1, "the comment must advance, not only publish a final result")
+        self.assertTrue(any("**Progress:**" in body for body in bodies))
+        self.assertTrue(any("chunks" in body for body in bodies))
 
     def test_claim_persists_binding_and_one_status_comment_id(self) -> None:
         binding = pr_review.PullBinding("a" * 40, "b" * 40, "c" * 40, pr_review.RUBRIC_VERSION)
