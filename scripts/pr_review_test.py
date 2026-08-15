@@ -268,7 +268,7 @@ class ImmutableBindingTest(unittest.TestCase):
         # The head moves immediately, so the run must stop before spending the
         # provider budget on a commit whose result can only be historical.
         with mock.patch.object(pr_review, "get_pull_binding", side_effect=[original, moved, moved]), mock.patch.object(
-            pr_review, "find_running_comment", return_value=None
+            pr_review, "find_running_comment", return_value=(None, True)
         ), mock.patch.object(pr_review, "create_comment", return_value={"id": 7}), mock.patch.object(
             pr_review, "fetch_bound_diff", return_value=diff
         ), mock.patch.object(
@@ -281,43 +281,12 @@ class ImmutableBindingTest(unittest.TestCase):
         self.assertTrue(progress.head_changed)
         self.assertEqual(call_model.call_count, 0, "a moved head must not spend a provider call")
 
-    def test_running_comment_advances_while_the_review_works(self) -> None:
-        # A deep pass runs for many minutes. Without an advancing comment the
-        # status is indistinguishable from a hung job, which is what made a
-        # working review look broken.
-        binding = pr_review.PullBinding("a" * 40, "b" * 40, "c" * 40, pr_review.RUBRIC_VERSION)
-        diff = "\n".join(
-            [
-                "diff --git a/internal/a.go b/internal/a.go",
-                "--- a/internal/a.go",
-                "+++ b/internal/a.go",
-                "@@ -1 +1 @@",
-                "-old",
-                "+new",
-            ]
-        )
-        payload = {"findings": [], "changes": [{"path": "internal/a.go", "summary": "changes enforcement"}]}
-        with mock.patch.object(pr_review, "get_pull_binding", return_value=binding), mock.patch.object(
-            pr_review, "find_running_comment", return_value=None
-        ), mock.patch.object(pr_review, "create_comment", return_value={"id": 7}), mock.patch.object(
-            pr_review, "fetch_bound_diff", return_value=diff
-        ), mock.patch.object(pr_review, "call_model", side_effect=[payload, {"findings": []}]), mock.patch.object(
-            pr_review, "provider_configuration", return_value=("https://provider.example/v1/chat/completions", "key")
-        ), mock.patch.object(pr_review, "compare_incompleteness", return_value=None), mock.patch.object(
-            pr_review, "update_comment"
-        ) as update:
-            pr_review.run_review("owner/repo", "42", "token", "default", "c" * 40)
-        bodies = [call.args[3] for call in update.call_args_list]
-        self.assertGreater(len(bodies), 1, "the comment must advance, not only publish a final result")
-        self.assertTrue(any("**Progress:**" in body for body in bodies))
-        self.assertTrue(any("chunks" in body for body in bodies))
-
     def test_claim_persists_binding_and_one_status_comment_id(self) -> None:
         binding = pr_review.PullBinding("a" * 40, "b" * 40, "c" * 40, pr_review.RUBRIC_VERSION)
         with tempfile.NamedTemporaryFile() as output, mock.patch.dict(
             pr_review.os.environ, {"GITHUB_OUTPUT": output.name}, clear=False
         ), mock.patch.object(pr_review, "get_pull_binding", return_value=binding), mock.patch.object(
-            pr_review, "find_running_comment", return_value=None
+            pr_review, "find_running_comment", return_value=(None, True)
         ), mock.patch.object(pr_review, "create_comment", return_value={"id": 17}) as create:
             pr_review.claim_review("owner/repo", "42", "token", "default", "c" * 40)
             output.seek(0)
@@ -335,7 +304,7 @@ class ProviderConfigurationFinalizationTest(unittest.TestCase):
         # the claimed comment on running, which then refused later reviews.
         binding = pr_review.PullBinding("a" * 40, "b" * 40, "c" * 40, pr_review.RUBRIC_VERSION)
         with mock.patch.object(pr_review, "get_pull_binding", return_value=binding), mock.patch.object(
-            pr_review, "find_running_comment", return_value=None
+            pr_review, "find_running_comment", return_value=(None, True)
         ), mock.patch.object(pr_review, "create_comment", return_value={"id": 7}), mock.patch.object(
             pr_review, "provider_configuration", side_effect=pr_review.ProviderConfigurationError("none")
         ), mock.patch.object(pr_review, "update_comment") as update:
@@ -460,8 +429,9 @@ class AdmissionMarkerTest(unittest.TestCase):
                 return self._payload
 
         with mock.patch.object(pr_review.requests, "get", side_effect=[Response(page1), Response(page2)]) as get:
-            found = pr_review.find_running_comment("owner/repo", "42", "token", "corr")
+            found, scanned = pr_review.find_running_comment("owner/repo", "42", "token", "corr")
         self.assertIsNotNone(found)
+        self.assertTrue(scanned)
         self.assertEqual(get.call_count, 2)
 
     def test_an_ancient_running_marker_does_not_wedge_later_reviews(self) -> None:
@@ -486,7 +456,61 @@ class AdmissionMarkerTest(unittest.TestCase):
                 ]
 
         with mock.patch.object(pr_review.requests, "get", return_value=Response()):
-            self.assertIsNone(pr_review.find_running_comment("owner/repo", "42", "token", "corr"))
+            found, scanned = pr_review.find_running_comment("owner/repo", "42", "token", "corr")
+            self.assertIsNone(found)
+            self.assertTrue(scanned)
+
+
+class AdmissionFailsClosedTest(unittest.TestCase):
+    def test_an_unreadable_page_reports_an_incomplete_scan(self) -> None:
+        # Not finding a marker is only evidence that none exists when every
+        # page was read. A transient error previously read as "nothing running"
+        # and authorized a second concurrent provider run on the same head.
+        with mock.patch.object(pr_review.requests, "get", side_effect=pr_review.requests.RequestException()):
+            found, scanned = pr_review.find_running_comment("owner/repo", "42", "token", "corr")
+        self.assertIsNone(found)
+        self.assertFalse(scanned)
+
+    def test_claim_refuses_when_the_scan_could_not_complete(self) -> None:
+        binding = pr_review.PullBinding("a" * 40, "b" * 40, "c" * 40, pr_review.RUBRIC_VERSION)
+        with tempfile.NamedTemporaryFile() as output, mock.patch.dict(
+            pr_review.os.environ, {"GITHUB_OUTPUT": output.name}, clear=False
+        ), mock.patch.object(pr_review, "get_pull_binding", return_value=binding), mock.patch.object(
+            pr_review, "find_running_comment", return_value=(None, False)
+        ), mock.patch.object(pr_review, "create_comment", return_value={"id": 11}):
+            pr_review.claim_review("owner/repo", "42", "token", "default", "c" * 40)
+            output.seek(0)
+            values = output.read().decode("utf-8")
+        self.assertIn("claimed=false", values)
+
+
+class JudgeContextBoundTest(unittest.TestCase):
+    def test_context_fetches_are_bounded_not_only_the_payload(self) -> None:
+        # Context was fetched for every distinct path before the budget excluded
+        # most of them, so a large candidate set could spend longer on requests
+        # than the job is allowed to run and be killed before publishing partial.
+        binding = pr_review.PullBinding("a" * 40, "b" * 40, "c" * 40, pr_review.RUBRIC_VERSION)
+        candidates = [
+            pr_review.Finding("low", f"internal/pkg{index}/a.go", 1, "t", "w", "f")
+            for index in range(pr_review.MAX_JUDGE_CONTEXT_FETCHES + 25)
+        ]
+        judged_counts: list[int] = []
+        real_prompt = pr_review.build_judge_prompt
+
+        def record(kept: list[object], contexts: dict[str, str]) -> tuple[str, str]:
+            judged_counts.append(len(kept))
+            return real_prompt(kept, contexts)
+
+        def decide(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return {"findings": [{"index": i, "verdict": "keep", "reason": "r"} for i in range(judged_counts[-1])]}
+
+        with mock.patch.object(pr_review, "fetch_file_context", return_value="line\n" * 10) as fetch, mock.patch.object(
+            pr_review, "build_judge_prompt", side_effect=record
+        ), mock.patch.object(pr_review, "call_model", side_effect=decide):
+            _, judged, excluded = pr_review.judge_findings("owner/repo", "token", binding, "deep", candidates)
+        self.assertTrue(judged)
+        self.assertLessEqual(fetch.call_count, pr_review.MAX_JUDGE_CONTEXT_FETCHES)
+        self.assertTrue(excluded)
 
 
 class WallClockBudgetTest(unittest.TestCase):
@@ -515,7 +539,7 @@ class WallClockBudgetTest(unittest.TestCase):
         clock = iter([0.0] + [pr_review.REVIEW_WALL_CLOCK_SECONDS + 1_000.0] * 50)
         with mock.patch.object(pr_review.time, "monotonic", side_effect=lambda: next(clock)), mock.patch.object(
             pr_review, "get_pull_binding", return_value=binding
-        ), mock.patch.object(pr_review, "find_running_comment", return_value=None), mock.patch.object(
+        ), mock.patch.object(pr_review, "find_running_comment", return_value=(None, True)), mock.patch.object(
             pr_review, "create_comment", return_value={"id": 7}
         ), mock.patch.object(pr_review, "fetch_bound_diff", return_value=diff), mock.patch.object(
             pr_review, "call_model"

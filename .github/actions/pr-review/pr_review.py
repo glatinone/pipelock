@@ -57,6 +57,9 @@ DEEP_INPUT_TOKEN_BUDGET = 16_000
 FAST_MAX_CHUNKS = 3
 DEEP_MAX_CHUNKS = 8
 MAX_UNITS_PER_CHUNK = 20
+# Each judge context fetch allows 30 seconds, so an unbounded candidate set
+# could spend longer on requests than the whole job is permitted to run.
+MAX_JUDGE_CONTEXT_FETCHES = 20
 MAX_DELETION_LINES_PER_HUNK = 24
 REPO_PATTERN = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 RUBRIC_VERSION = "2026-08-14.1"
@@ -747,13 +750,18 @@ def _running_marker_is_stale(comment: dict[str, Any]) -> bool:
     return age > datetime.timedelta(minutes=STALE_RUNNING_MINUTES)
 
 
-def find_running_comment(repo: str, pr_number: str, token: str, correlation: str) -> dict[str, Any] | None:
-    """Find a running status comment, reading every page of issue comments.
+def find_running_comment(repo: str, pr_number: str, token: str, correlation: str) -> tuple[dict[str, Any] | None, bool]:
+    """Find a running status comment, and report whether the scan was complete.
 
     This endpoint returns comments oldest first, so a single unpaginated request
     holds the 100 OLDEST comments.  On a busy pull request the running marker is
     on a later page, the admission check would miss it, and a second review
     would start concurrently against the same head.
+
+    Returns (marker, complete).  An unreadable page, a non-200 response, or
+    exhausting the page cap yields complete=False: the caller cannot conclude
+    that no review is running, and must fail closed rather than authorize a
+    second provider run against the same head.
     """
     marker = f"<!-- {STATUS_MARKER} state=running"
     found: dict[str, Any] | None = None
@@ -767,16 +775,18 @@ def find_running_comment(repo: str, pr_number: str, token: str, correlation: str
             )
         except requests.RequestException:
             log_phase("admission-check", attempt=page, status="request-error", correlation=correlation)
-            return found
+            return found, False
         log_phase("admission-check", attempt=page, status=response.status_code, correlation=correlation)
         if response.status_code != 200:
-            return found
+            return found, False
         try:
             comments = response.json()
         except ValueError:
-            return found
-        if not isinstance(comments, list) or not comments:
-            return found
+            return found, False
+        if not isinstance(comments, list):
+            return found, False
+        if not comments:
+            return found, True
         for comment in reversed(comments):
             if not isinstance(comment, dict):
                 continue
@@ -789,8 +799,8 @@ def find_running_comment(repo: str, pr_number: str, token: str, correlation: str
                 found = comment
                 break
         if len(comments) < 100:
-            return found
-    return found
+            return found, True
+    return found, False
 
 
 def fetch_file_context(repo: str, path: str, head_sha: str, token: str, correlation: str) -> str | None:
@@ -856,6 +866,14 @@ def judge_findings(
     for finding in candidates:
         addition = estimate_tokens(finding.title + finding.why + finding.fix + finding.path)
         context = contexts.get(finding.path)
+        if context is None and len(contexts) >= MAX_JUDGE_CONTEXT_FETCHES:
+            # Bound the fetches themselves, not just the payload. Context was
+            # previously fetched for every distinct path before the budget
+            # excluded most of them, so a large candidate set could spend more
+            # time on requests than the job is allowed to run and be killed
+            # before it could publish partial.
+            excluded.append(finding)
+            continue
         if context is None:
             content = fetch_file_context(repo, finding.path, binding.head_sha, token, binding.correlation)
             if content is None:
@@ -958,44 +976,6 @@ def head_has_moved(repo: str, pr_number: str, token: str, binding: PullBinding, 
         return False
 
 
-def publish_progress(
-    repo: str,
-    comment_id: int,
-    token: str,
-    binding: PullBinding,
-    mode: str,
-    classification: list[str],
-    progress: ReviewProgress,
-    phase: str,
-) -> None:
-    """Advance the running status comment so a long review is visibly alive.
-
-    A deep pass legitimately runs for many minutes. Without this the comment
-    reads "pending immutable diff fetch" for the whole run, which is
-    indistinguishable from a hung job. Failures here are ignored: progress
-    reporting must never end a review that is working.
-    """
-    body = "\n".join(
-        [
-            "## AI PR Review",
-            "",
-            "**Status:** `running`",
-            f"**Command:** `{'/review deep' if mode == 'deep' else '/review'}`",
-            f"**Model:** `{model_for_mode(mode)}` (`{reasoning_for_mode(mode)}` reasoning)",
-            f"**Binding:** base `{binding.base_sha}` head `{binding.head_sha}`",
-            f"**Review identity:** `{binding.correlation}`",
-            f"**Classification:** {', '.join(classification) if classification else 'empty diff'}",
-            f"**Progress:** {phase}; {progress.reviewed_units}/{progress.expected_units} representable units reviewed.",
-            "",
-            f"<!-- {STATUS_MARKER} state=running identity={binding.correlation} -->",
-        ]
-    )
-    try:
-        update_comment(repo, comment_id, token, body, binding.correlation)
-    except (ReviewError, requests.RequestException):
-        log_phase("progress", status="update-failed", correlation=binding.correlation)
-
-
 def render_status(binding: PullBinding, mode: str, classification: list[str], progress: ReviewProgress, state: str, manifest: list[dict[str, Any]]) -> str:
     model = model_for_mode(mode)
     severity_order = {"high": 0, "medium": 1, "low": 2}
@@ -1046,30 +1026,66 @@ def render_status(binding: PullBinding, mode: str, classification: list[str], pr
     return "\n".join(lines)
 
 
+def workflow_run_url() -> str | None:
+    """Link to this run so a long review is visibly alive.
+
+    Liveness deliberately comes from a link rather than from editing this
+    comment as the review proceeds. A progress edit is a second writer of the
+    same comment, and a PATCH that times out may still have been applied, so a
+    late progress write can land after the terminal write and revert a finished
+    review to running. GitHub already reports progress on the run page.
+    """
+    server = os.environ.get("GITHUB_SERVER_URL", "")
+    repository = os.environ.get("GITHUB_REPOSITORY", "")
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    if not all((server, repository, run_id)):
+        return None
+    return f"{server}/{repository}/actions/runs/{run_id}"
+
+
 def _initial_status(binding: PullBinding, mode: str) -> str:
-    return "\n".join(
+    deep = mode == "deep"
+    run_url = workflow_run_url()
+    lines = [
+        "## AI PR Review",
+        "",
+        "**Status:** `running`",
+        f"**Command:** `{'/review deep' if deep else '/review'}`",
+        f"**Model:** `{model_for_mode(mode)}` (`{reasoning_for_mode(mode)}` reasoning)",
+        f"**Binding:** base `{binding.base_sha}` head `{binding.head_sha}`",
+        f"**Review identity:** `{binding.correlation}`",
+        "**Classification:** pending immutable diff fetch",
+    ]
+    if run_url:
+        lines.append(f"**Progress:** [live run log]({run_url})")
+    lines.extend(
         [
-            "## AI PR Review",
             "",
-            "**Status:** `running`",
-            f"**Command:** `{'/review deep' if mode == 'deep' else '/review'}`",
-            f"**Model:** `{model_for_mode(mode)}` (`{reasoning_for_mode(mode)}` reasoning)",
-            f"**Binding:** base `{binding.base_sha}` head `{binding.head_sha}`",
-            f"**Review identity:** `{binding.correlation}`",
-            "**Classification:** pending immutable diff fetch",
+            "A deep review reasons over the diff in bounded chunks and commonly takes several minutes."
+            if deep
+            else "This comment is replaced with the result when the review finishes.",
             "",
             f"<!-- {STATUS_MARKER} state=running identity={binding.correlation} -->",
         ]
     )
+    return "\n".join(lines)
 
 
 def claim_review(repo: str, pr_number: str, token: str, mode: str, reviewer_sha: str) -> None:
     """Atomically enough for one operator: persist a running marker before review work."""
     binding = get_pull_binding(repo, pr_number, token, reviewer_sha)
-    active = find_running_comment(repo, pr_number, token, binding.correlation)
-    if active:
-        link = active.get("html_url") if isinstance(active.get("html_url"), str) else "the existing review status"
-        create_comment(repo, pr_number, token, f"A review is already running: {link}", binding.correlation)
+    active, scanned = find_running_comment(repo, pr_number, token, binding.correlation)
+    if active or not scanned:
+        # Fail closed on an incomplete scan. Not finding a marker is only
+        # evidence that none exists when every page was read; otherwise a
+        # transient error would authorize a second concurrent provider run
+        # against the same head.
+        if active:
+            link = active.get("html_url") if isinstance(active.get("html_url"), str) else "the existing review status"
+            message = f"A review is already running: {link}"
+        else:
+            message = "Could not confirm whether a review is already running, so this command did not start one. Try again."
+        create_comment(repo, pr_number, token, message, binding.correlation)
         write_action_outputs(claimed="false")
         return
     comment = create_comment(repo, pr_number, token, _initial_status(binding, mode), binding.correlation)
@@ -1098,9 +1114,9 @@ def run_review(
     deadline = time.monotonic() + REVIEW_WALL_CLOCK_SECONDS
     binding = binding or get_pull_binding(repo, pr_number, token, reviewer_sha)
     if status_comment_id is None:
-        active = find_running_comment(repo, pr_number, token, binding.correlation)
-        if active:
-            link = active.get("html_url") if isinstance(active.get("html_url"), str) else "the existing review status"
+        active, scanned = find_running_comment(repo, pr_number, token, binding.correlation)
+        if active or not scanned:
+            link = active.get("html_url") if isinstance(active, dict) and isinstance(active.get("html_url"), str) else "the existing review status"
             create_comment(repo, pr_number, token, f"A review is already running: {link}", binding.correlation)
             return "already-running", ReviewProgress()
         comment = create_comment(repo, pr_number, token, _initial_status(binding, mode), binding.correlation)
@@ -1143,7 +1159,6 @@ def run_review(
             progress.incomplete_reasons.append("one or more deletion hunks were collapsed")
         reviewed_changes: list[dict[str, str]] = []
         candidates: list[Finding] = []
-        publish_progress(repo, comment["id"], token, binding, mode, classification, progress, f"reviewing 0/{len(chunks)} chunks")
         for chunk_index, chunk in enumerate(chunks, 1):
             # Checked before each chunk rather than only at the end. A deep pass
             # runs for many minutes, and a head that moved early would otherwise
@@ -1171,9 +1186,6 @@ def run_review(
             progress.reviewed_units += len(chunk)
             candidates.extend(findings)
             reviewed_changes.extend(changes)
-            publish_progress(
-                repo, comment["id"], token, binding, mode, classification, progress, f"reviewing {chunk_index}/{len(chunks)} chunks"
-            )
         synthesis_ready = (
             progress.reviewed_units == progress.expected_units
             and not progress.aggregation_failed
