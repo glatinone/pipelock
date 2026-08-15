@@ -513,6 +513,22 @@ class JudgeContextBoundTest(unittest.TestCase):
         self.assertTrue(excluded)
 
 
+class JudgeFetchCapTest(unittest.TestCase):
+    def test_paths_dropped_by_the_token_budget_still_count_as_fetches(self) -> None:
+        # The cap previously counted payload entries, so a path fetched and then
+        # dropped by the token budget was never recorded and requests kept
+        # going. Measured at 60 requests against a limit of 20.
+        binding = pr_review.PullBinding("a" * 40, "b" * 40, "c" * 40, pr_review.RUBRIC_VERSION)
+        candidates = [pr_review.Finding("low", f"p{index}/a.go", 1, "t", "w", "f") for index in range(60)]
+        with mock.patch.object(pr_review, "fetch_file_context", return_value="x" * 80_000) as fetch, mock.patch.object(
+            pr_review, "call_model", return_value={"findings": [{"index": 0, "verdict": "keep", "reason": "r"}]}
+        ):
+            _, judged, excluded = pr_review.judge_findings("owner/repo", "token", binding, "deep", candidates)
+        self.assertTrue(judged)
+        self.assertEqual(fetch.call_count, pr_review.MAX_JUDGE_CONTEXT_FETCHES)
+        self.assertEqual(len(excluded), len(candidates) - 1)
+
+
 class WallClockBudgetTest(unittest.TestCase):
     def test_budget_refuses_a_call_that_cannot_finish_before_the_job_timeout(self) -> None:
         now = 1_000.0

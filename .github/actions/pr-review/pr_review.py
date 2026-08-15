@@ -859,26 +859,29 @@ def judge_findings(
     if not candidates:
         return [], True, []
     budget, _ = input_limits(mode)
+    # Fetched contexts are cached and counted separately from the ones that end
+    # up in the payload. Counting only payload entries bounded nothing: a path
+    # fetched and then dropped by the token budget was never recorded, so an
+    # over-budget candidate set kept issuing requests. Measured at 60 requests
+    # against a limit of 20 before this split.
+    fetched: dict[str, str] = {}
     contexts: dict[str, str] = {}
     retained: list[Finding] = []
     excluded: list[Finding] = []
     used = 0
     for finding in candidates:
         addition = estimate_tokens(finding.title + finding.why + finding.fix + finding.path)
-        context = contexts.get(finding.path)
-        if context is None and len(contexts) >= MAX_JUDGE_CONTEXT_FETCHES:
-            # Bound the fetches themselves, not just the payload. Context was
-            # previously fetched for every distinct path before the budget
-            # excluded most of them, so a large candidate set could spend more
-            # time on requests than the job is allowed to run and be killed
-            # before it could publish partial.
-            excluded.append(finding)
-            continue
+        context = fetched.get(finding.path)
         if context is None:
+            if len(fetched) >= MAX_JUDGE_CONTEXT_FETCHES:
+                excluded.append(finding)
+                continue
             content = fetch_file_context(repo, finding.path, binding.head_sha, token, binding.correlation)
             if content is None:
                 return [], False, []
             context = _line_context(content, finding.line)
+            fetched[finding.path] = context
+        if finding.path not in contexts:
             addition += estimate_tokens(context)
         if retained and used + addition > budget:
             excluded.append(finding)
