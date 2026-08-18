@@ -182,11 +182,17 @@ func scanResponseOpts(line []byte, sc *scanner.Scanner, opts ResponseScanOptions
 	}
 }
 
+// responseScanAction resolves the effective response-scan action. A per-server
+// trust override may only make scanning stricter than the section action, never
+// weaker, so the override is clamped against it rather than replacing it. The
+// callers that build the override clamp it too; this is the enforcement-side
+// backstop, and clamping twice is idempotent.
 func responseScanAction(sc *scanner.Scanner, opts ResponseScanOptions) string {
-	if opts.ActionOverride != "" {
-		return opts.ActionOverride
+	sectionAction := sc.ResponseAction()
+	if opts.ActionOverride == "" {
+		return sectionAction
 	}
-	return sc.ResponseAction()
+	return config.StricterAction(opts.ActionOverride, sectionAction)
 }
 
 func responseScanTrustClass(opts ResponseScanOptions) string {

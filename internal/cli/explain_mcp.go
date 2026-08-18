@@ -184,7 +184,7 @@ func buildMCPExplainReport(cfg *config.Config, cfgLabel, serverName string, line
 	if configuredTrust, ok := cfg.MCPResponseTrustForServer(serverName); ok {
 		trust = configuredTrust
 	}
-	action := config.MCPResponseActionForTrust(trust)
+	action := cfg.MCPResponseActionForServer(serverName)
 	report.TrustClass = trust
 
 	// Scan with NO suppression so explain reports what WOULD be detected; the

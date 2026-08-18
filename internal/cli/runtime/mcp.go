@@ -271,7 +271,7 @@ func applyMCPResponseSuppressOpts(opts *mcp.MCPProxyOpts, cfg *config.Config, se
 		taintTrusted = cfg.TaintTrustsMCPServer(serverName)
 	}
 	opts.ResponseTrustClass = trust
-	opts.ResponseActionOverride = config.MCPResponseActionForTrust(trust)
+	opts.ResponseActionOverride = cfg.MCPResponseActionForServer(serverName)
 	opts.TaintTrustedSource = taintTrusted
 }
 

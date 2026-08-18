@@ -929,7 +929,7 @@ func (s *Server) Start(ctx context.Context) error {
 			return trust
 		}
 		mcpResponseActionFn := func() string {
-			return config.MCPResponseActionForTrust(mcpResponseTrustFn())
+			return s.proxy.CurrentConfig().MCPResponseActionForServer(s.opts.MCPServerName)
 		}
 		mcpTaintTrustedFn := func() bool {
 			c := s.proxy.CurrentConfig()

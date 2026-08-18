@@ -814,6 +814,55 @@ func MCPResponseActionForTrust(trust string) string {
 	}
 }
 
+// StricterAction returns whichever of a and b is stronger under the canonical
+// action ordering shared with the reload-downgrade warnings, so a trust/section
+// comparison can never disagree with an old/new comparison about which of two
+// actions is stronger.
+//
+// An action this package cannot rank is not evidence about strength, so an
+// unrankable side yields the other side rather than silently winning. When
+// neither side ranks, a is returned: every caller passes the trust-derived
+// action there, and that mapping is itself fail-closed.
+func StricterAction(a, b string) string {
+	aStrength, aOK := reloadActionStrength(a)
+	bStrength, bOK := reloadActionStrength(b)
+	switch {
+	case !aOK && !bOK:
+		return a
+	case !aOK:
+		return b
+	case !bOK:
+		return a
+	case bStrength > aStrength:
+		return b
+	default:
+		return a
+	}
+}
+
+// MCPResponseActionForServer returns the effective MCP response-scan action for
+// serverName: the trust class mapping, clamped so it can only ever be stricter
+// than the enclosing response_scanning.action.
+//
+// Trust is allowed to tighten scanning and never to relax it. Without the clamp
+// a reasoning-class server silently downgraded a configured block section to
+// warn, because the trust-derived action was applied as an unconditional
+// override. An untrusted server under a warn section still blocks, because that
+// is trust being stricter.
+//
+// A nil config resolves to the untrusted class, matching per-server lookup.
+func (c *Config) MCPResponseActionForServer(serverName string) string {
+	trust := ResponseTrustUntrusted
+	sectionAction := ""
+	if c != nil {
+		if configuredTrust, ok := c.MCPResponseTrustForServer(serverName); ok {
+			trust = configuredTrust
+		}
+		sectionAction = c.ResponseScanning.Action
+	}
+	return StricterAction(MCPResponseActionForTrust(trust), sectionAction)
+}
+
 // GenericSSEScanning configures inline body scanning of non-A2A
 // text/event-stream responses (OpenAI chat completions, Anthropic
 // messages, OpenAI-compatible gateways, generic LLM SSE). When disabled the proxy
