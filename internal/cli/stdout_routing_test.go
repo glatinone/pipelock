@@ -7,10 +7,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
 )
 
 // The routing bug these tests exist for was invisible to every existing CLI
@@ -47,10 +50,17 @@ func runCLIHelper() {
 		os.Exit(2)
 	}
 	// No SetOut, no SetErr. Whatever routing production has is what runs here.
+	//
+	// The error handling mirrors cmd/pipelock/main.go deliberately. The root
+	// command sets SilenceErrors, so main is what prints the error and picks the
+	// status. An earlier version of this helper just exited 1, which made the
+	// child produce an empty stderr and hid whether the CLI reports a failure
+	// usefully or only fails silently.
 	cmd := rootCmd()
 	cmd.SetArgs(args)
 	if err := cmd.Execute(); err != nil {
-		os.Exit(1)
+		_, _ = fmt.Fprintln(os.Stderr, err)
+		os.Exit(cliutil.ExitCodeOf(err))
 	}
 	os.Exit(0)
 }

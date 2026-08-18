@@ -195,5 +195,40 @@ Quick start:
 		cmd.AddCommand(extra)
 	}
 
+	guardGroupingCommands(cmd)
+
 	return cmd
+}
+
+// guardGroupingCommands makes a command that only groups subcommands reject a
+// subcommand it does not have, instead of reporting success.
+//
+// cobra checks for an unknown subcommand on the ROOT command only: legacyArgs
+// returns its "unknown command" error solely when the command has no parent.
+// Every nested group therefore accepted any word, fell through to the help
+// path, and returned nil, so the process exited 0. `pipelock contain instal`
+// printed help and reported success while nothing was installed, which in a
+// setup script reads as containment being in place when it is not.
+//
+// Setting Args alone does not fix it. cobra returns flag.ErrHelp for a
+// non-runnable command BEFORE it validates arguments (command.go, the
+// `!c.Runnable()` check precedes ValidateArgs), so an argument constraint on a
+// command with no action is never consulted. The group needs an action for the
+// constraint to be reached, and printing help is the action it already had.
+//
+// Applied by walking the assembled tree rather than by annotating each command,
+// so a group added later is covered without anyone remembering to.
+func guardGroupingCommands(cmd *cobra.Command) {
+	for _, sub := range cmd.Commands() {
+		guardGroupingCommands(sub)
+	}
+	// A group is a command with children and no action of its own. Anything
+	// runnable is left alone: it may legitimately take positional arguments.
+	if cmd.Runnable() || !cmd.HasSubCommands() {
+		return
+	}
+	cmd.Args = cobra.NoArgs
+	cmd.RunE = func(c *cobra.Command, _ []string) error {
+		return c.Help()
+	}
 }
