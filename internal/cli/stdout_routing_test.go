@@ -102,6 +102,12 @@ func TestCLISendsResultsToStdout(t *testing.T) {
 		{name: "version", args: []string{"version"}, want: "pipelock version"},
 		{name: "audit score", args: []string{"audit", "score"}, want: "Pipelock Config Security Score"},
 		{name: "generate docker-compose", args: []string{"generate", "docker-compose"}, want: "services:"},
+		// check and simulate below are the SUCCESS paths. The failing-check case
+		// in the next test proves a diagnostic stays on stderr; it says nothing
+		// about where a successful run puts its result. simulate in particular
+		// had a fix here and no test.
+		{name: "check", args: []string{"check"}, want: "Using default config"},
+		{name: "simulate", args: []string{"simulate"}, want: "Pipelock Attack Simulation"},
 	}
 
 	for _, tc := range cases {
