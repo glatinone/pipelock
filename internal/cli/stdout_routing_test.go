@@ -5,8 +5,10 @@ package cli
 
 import (
 	"bytes"
-	"io"
+	"encoding/json"
+	"errors"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -17,47 +19,81 @@ import (
 // in the buffer the test named "stdout" whether or not production would send it
 // there. Production never called SetOut, so Print* fell through to stderr.
 //
-// These tests capture the real os.Stdout and os.Stderr file descriptors and
-// drive the root command with no writer overrides at all, which is the state a
-// person running the binary is in.
+// So these tests do not install writers at all. They re-exec this test binary
+// as a child process, have it run the real root command, and read the child's
+// actual stdout and stderr pipes. That is the state a person running the binary
+// is in, and it keeps the two streams genuinely separate rather than separated
+// by agreement.
+//
+// A subprocess is also what makes this safe to run alongside the 24 parallel
+// tests in this package. Replacing os.Stdout in-process would swap the file
+// under any test running concurrently, and rootCmd itself reads os.Stdout when
+// it is constructed, so a parallel test building a command inside the capture
+// window would write into this test's pipe and then into a closed descriptor.
 
-// captureStd runs fn with the process's real stdout and stderr replaced by
-// pipes, and returns what was written to each.
-func captureStd(t *testing.T, fn func()) (stdout, stderr string) {
-	t.Helper()
+// routingHelperEnv carries the argument vector to the re-executed child. Its
+// presence is what tells TestMain to run the CLI instead of the test suite.
+const routingHelperEnv = "PIPELOCK_TEST_CLI_ROUTING_ARGS"
 
-	outR, outW, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("stdout pipe: %v", err)
+// runCLIHelper reports whether this process was started to act as the CLI, and
+// if so runs the real root command and exits. TestMain calls it first.
+func runCLIHelper() {
+	encoded, ok := os.LookupEnv(routingHelperEnv)
+	if !ok {
+		return
 	}
-	errR, errW, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("stderr pipe: %v", err)
+	var args []string
+	if err := json.Unmarshal([]byte(encoded), &args); err != nil {
+		os.Exit(2)
 	}
-
-	origOut, origErr := os.Stdout, os.Stderr
-	os.Stdout, os.Stderr = outW, errW
-
-	// Drain both pipes concurrently. A command that writes more than the pipe
-	// buffer would otherwise block forever with the reader still parked.
-	outCh := make(chan []byte, 1)
-	errCh := make(chan []byte, 1)
-	go func() { var b bytes.Buffer; _, _ = io.Copy(&b, outR); outCh <- b.Bytes() }()
-	go func() { var b bytes.Buffer; _, _ = io.Copy(&b, errR); errCh <- b.Bytes() }()
-
-	func() {
-		defer func() {
-			os.Stdout, os.Stderr = origOut, origErr
-			_ = outW.Close()
-			_ = errW.Close()
-		}()
-		fn()
-	}()
-
-	return string(<-outCh), string(<-errCh)
+	// No SetOut, no SetErr. Whatever routing production has is what runs here.
+	cmd := rootCmd()
+	cmd.SetArgs(args)
+	if err := cmd.Execute(); err != nil {
+		os.Exit(1)
+	}
+	os.Exit(0)
 }
 
-func TestRootCommandSendsResultsToStdout(t *testing.T) {
+// runCLI executes the given pipelock arguments in a child process and returns
+// its stdout, stderr, and exit code.
+func runCLI(t *testing.T, args ...string) (stdout, stderr string, code int) {
+	t.Helper()
+
+	encoded, err := json.Marshal(args)
+	if err != nil {
+		t.Fatalf("encode args: %v", err)
+	}
+
+	// os.Executable resolves this test binary rather than trusting os.Args[0],
+	// which the caller controls and which may be a relative path.
+	//
+	// -test.run matches nothing, so if the helper guard ever fails to fire the
+	// child runs zero tests and reports empty output rather than re-running the
+	// whole suite inside itself. The pipelock arguments under test travel in an
+	// environment variable, so the argument vector here stays constant.
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve test binary: %v", err)
+	}
+	child := exec.CommandContext(t.Context(), self, "-test.run=XXX_NO_SUCH_TEST")
+	child.Env = append(os.Environ(), routingHelperEnv+"="+string(encoded))
+
+	var outBuf, errBuf bytes.Buffer
+	child.Stdout = &outBuf
+	child.Stderr = &errBuf
+
+	if err := child.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Fatalf("run %v: %v", args, err)
+		}
+		code = exitErr.ExitCode()
+	}
+	return outBuf.String(), errBuf.String(), code
+}
+
+func TestCLISendsResultsToStdout(t *testing.T) {
 	cases := []struct {
 		name string
 		args []string
@@ -70,37 +106,29 @@ func TestRootCommandSendsResultsToStdout(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var runErr error
-			stdout, stderr := captureStd(t, func() {
-				// Deliberately no SetOut or SetErr. Overriding either one here
-				// would reintroduce exactly the blindness this test exists to
-				// remove.
-				cmd := rootCmd()
-				cmd.SetArgs(tc.args)
-				runErr = cmd.Execute()
-			})
-			if runErr != nil {
-				t.Fatalf("%v: %v", tc.args, runErr)
+			stdout, stderr, code := runCLI(t, tc.args...)
+			if code != 0 {
+				t.Fatalf("%v exited %d\nstderr: %s", tc.args, code, stderr)
 			}
 			if !strings.Contains(stdout, tc.want) {
 				t.Errorf("result did not reach stdout.\nstdout: %q\nstderr: %q", stdout, stderr)
+			}
+			// Without this, a command writing the result to BOTH streams would
+			// pass, and the test would prove nothing about routing.
+			if strings.Contains(stderr, tc.want) {
+				t.Errorf("result also leaked to stderr.\nstdout: %q\nstderr: %q", stdout, stderr)
 			}
 		})
 	}
 }
 
-func TestRootCommandKeepsDiagnosticsOffStdout(t *testing.T) {
+func TestCLIKeepsDiagnosticsOffStdout(t *testing.T) {
 	// Routing results to stdout must not drag diagnostics along with them.
 	// PrintErr* resolves through a separate writer that this change does not
 	// touch, so a failure report stays on stderr and a caller redirecting
 	// stdout to a file still sees why the command failed.
-	var runErr error
-	stdout, stderr := captureStd(t, func() {
-		cmd := rootCmd()
-		cmd.SetArgs([]string{"check", "--config", "/nonexistent-pipelock-config.yaml"})
-		runErr = cmd.Execute()
-	})
-	if runErr == nil {
+	stdout, stderr, code := runCLI(t, "check", "--config", "/nonexistent-pipelock-config.yaml")
+	if code == 0 {
 		t.Fatal("check accepted a config path that does not exist")
 	}
 	if !strings.Contains(stderr, "Config validation FAILED") {
