@@ -7,6 +7,8 @@
 package cli
 
 import (
+	"os"
+
 	"github.com/spf13/cobra"
 
 	"github.com/luckyPipewrench/pipelock/internal/cli/anchor"
@@ -74,6 +76,22 @@ Quick start:
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
+
+	// Route command results to stdout.
+	//
+	// cobra's Print, Printf, and Println all write to OutOrStderr(), which
+	// returns the configured out writer if one is set and otherwise falls back
+	// to stderr. Nothing set one, so every human-readable result in the CLI was
+	// landing on stderr while `pipelock version > file` produced an empty file.
+	// A test could not see it: SetOut in a test IS the writer OutOrStderr
+	// returns, so the text appeared exactly where the test looked for it.
+	//
+	// Setting it here makes the split the code already encodes mean what it
+	// reads as: Print* is a result and goes to stdout, PrintErr* is a
+	// diagnostic and still goes to stderr. Subcommands inherit it through the
+	// parent chain. Usage output is the one other consumer of this writer, and
+	// SilenceUsage on this command keeps cobra from ever emitting it.
+	cmd.SetOut(os.Stdout)
 
 	cmd.PersistentFlags().StringVar(&cliutil.PipelockHome, "home", "",
 		"pipelock home directory (default ~/.pipelock, or set PIPELOCK_HOME)")
