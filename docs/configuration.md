@@ -891,7 +891,7 @@ response_scanning:
       expires: "2099-12-31"
   mcp_servers:                  # MCP response trust classes; default is untrusted/block
     - server: "analysis-server"
-      trust: "reasoning"        # reasoning => warn; untrusted => block
+      trust: "reasoning"        # reasoning permits warn when action is warn; untrusted => block
   patterns:
     - name: "Custom Injection"
       regex: 'override system prompt'
@@ -908,7 +908,7 @@ response_scanning:
 | `size_exempt_scan_max_bytes` | `67108864` | Maximum bytes read into memory for one over-cap response from a `size_exempt_domains` host before the existing response scanners run. Exceeding this ceiling blocks fail-closed with no upstream bytes delivered. |
 | `size_exempt_scan_max_inflight_bytes` | `268435456` | Per-proxy-instance memory reservation budget for concurrent over-cap size-exempt scans. If a scan cannot reserve its ceiling immediately, the response blocks fail-closed instead of waiting. |
 | `unscannable_passthrough` | `[]` | Structured allowlist for deliberately unscannable opaque artifact responses. Matching entries stream unscanned and emit an audit warning plus an allow receipt on every use. Requires `host`, exact `paths`, non-textual `content_types`, `reason`, and non-expired `expires`; optional `added` documents the entry. The host must also match `size_exempt_domains`, the response must exceed the normal scan cap, include a positive `Content-Length`, and declare `Content-Disposition: attachment`. |
-| `mcp_servers` | `[]` | Per-MCP-server response trust classes keyed by `pipelock mcp proxy --server-name`. Omitted, missing, malformed, or non-matching servers are treated as `untrusted` and block response-injection findings. `reasoning` is an explicit opt-in that logs/warns but forwards the response. |
+| `mcp_servers` | `[]` | Per-MCP-server response trust classes keyed by `pipelock mcp proxy --server-name`. Omitted, missing, malformed, or non-matching servers are treated as `untrusted` and block response-injection findings. `reasoning` permits warn-and-forward only when `response_scanning.action` is `warn`; a stricter section action still applies. |
 | `patterns` | 33 built-in | Injection and state/control poisoning patterns |
 
 **Built-in patterns (33):** Prompt-injection and state/control poisoning coverage includes jailbreak phrases, system overrides, role overrides, instruction manipulation, encoded payloads, tool invocation commands, authority escalation, credential solicitation, credential path directives, auth material requirements, memory persistence directives, preference poisoning, covert-action directives, silent credential handling, and CJK-language override patterns. All patterns use DOTALL mode to match across newlines in multiline tool output.
@@ -921,9 +921,9 @@ response_scanning:
 
 **MCP required control:** `response_scanning.enabled: false` is currently ignored in `pipelock mcp proxy` and `pipelock mcp scan` modes because MCP response scanning is required. Pipelock runs with default response scanning and prints a warning naming the overridden field. `pipelock mcp scan` scans stdin responses for prompt injection and generic inbound credential patterns. It intentionally skips agent-owned environment and file-secret matching because receiving an agent-owned value is not exfiltration. It does not run tool policy or input scanning. JSON verdicts include `scanned: ["response_injection", "response_dlp"]` to make that scope explicit. This compatibility fallback will become a startup/reload error in a future release; remove the disable to silence the warning.
 
-**Exempt domains:** Trusted response APIs can return instruction-like text as part of normal operation, which can trigger false positives. Use `exempt_domains` to skip injection scanning for trusted providers. DLP scanning on the outbound request still runs — only the response injection scan is skipped. Applies to fetch proxy, forward proxy, CONNECT (TLS intercept), WebSocket, and reverse proxy. Does not affect MCP response scanning; MCP uses `response_scanning.mcp_servers` so a reasoning-model MCP server can warn while web-relay MCP servers keep blocking.
+**Exempt domains:** Trusted response APIs can return instruction-like text as part of normal operation, which can trigger false positives. Use `exempt_domains` to skip injection scanning for trusted providers. DLP scanning on the outbound request still runs, and only the response injection scan is skipped. Applies to fetch proxy, forward proxy, CONNECT (TLS intercept), WebSocket, and reverse proxy. Does not affect MCP response scanning; MCP uses `response_scanning.mcp_servers`, and a reasoning-model MCP server can warn only when the enclosing response action is also `warn`.
 
-**MCP response trust classes:** MCP response scanning defaults to `untrusted`, which blocks response-injection findings even if the generic `response_scanning.action` is `warn`. This protects web-relay servers such as fetch/search/scraping tools. To allow a reasoning-model MCP server to answer security-analysis questions that quote canonical jailbreak strings, opt in by server name:
+**MCP response trust classes:** MCP response scanning defaults to `untrusted`, which blocks response-injection findings even if the generic `response_scanning.action` is `warn`. This protects web-relay servers such as fetch/search/scraping tools. A trust class can tighten the enclosing `response_scanning.action`, but it cannot weaken it. To allow a reasoning-model MCP server to answer security-analysis questions that quote canonical jailbreak strings, set the enclosing action to `warn` and opt in by server name:
 
 ```yaml
 response_scanning:
@@ -932,7 +932,7 @@ response_scanning:
       trust: "reasoning"
 ```
 
-`reasoning` maps to `warn`; `untrusted` maps to `block`. Unknown trust values fail config validation, duplicate server entries fail validation, and entries are surfaced as warnings when `response_scanning.enabled` is false. The trust decision applies to MCP stdio, stdio-to-HTTP, reverse Streamable HTTP/SSE, and WebSocket surfaces because they share the MCP response scan gate. Block logs and JSON-RPC errors name the server, matched pattern, and trust class so operators can see whether a server needs an explicit trust-class review.
+`reasoning` maps to `warn`; `untrusted` maps to `block`. Pipelock applies the stricter of that mapping and `response_scanning.action`, so `block`, `ask`, and `strip` still apply to a reasoning server. Unknown trust values fail config validation, duplicate server entries fail validation, and entries are surfaced as warnings when `response_scanning.enabled` is false. The trust decision applies to MCP stdio, stdio-to-HTTP, reverse Streamable HTTP/SSE, and WebSocket surfaces because they share the MCP response scan gate. Block logs and JSON-RPC errors name the server, matched pattern, and trust class so operators can see whether a server needs an explicit trust-class review.
 
 Response trust does not make a server trusted for taint propagation. If a reasoning server is also an operator-trusted source whose clean responses should not contaminate the session, add the same `--server-name` value under `taint.trusted_mcp_servers`. Prompt-injection findings still raise hostile taint.
 
