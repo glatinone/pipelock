@@ -503,12 +503,17 @@ func TestQuickstartCmd_PrintsConcreteCommands(t *testing.T) {
 		t.Fatalf("quickstart failed: %v", err)
 	}
 	got := out.String()
+	// These used to name configs/balanced.yaml, which ships only in a source
+	// clone, so this test required the walkthrough to hand a reader a file they
+	// did not have. The walkthrough now creates its own config first and every
+	// later step refers to that; see quickstart_test.go for the property tests.
 	for _, want := range []string{
 		"pipelock install /usr/local/bin/pipelock",
-		"pipelock run --config configs/balanced.yaml",
+		"pipelock init --output ./pipelock.yaml",
+		"pipelock run --config ./pipelock.yaml",
 		"export HTTPS_PROXY=http://127.0.0.1:8888",
-		"pipelock mcp proxy --config configs/balanced.yaml",
-		"pipelock status --config configs/balanced.yaml",
+		"pipelock mcp proxy --config ./pipelock.yaml",
+		"pipelock status --config ./pipelock.yaml",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("quickstart output missing %q:\n%s", want, got)
