@@ -278,13 +278,16 @@ func TestRunWSProxy_BlocksInboundDLPResponse(t *testing.T) {
 	}
 }
 
+// The section action is warn here on purpose. Trust may only make scanning stricter than the
+// enclosing response_scanning.action, so a reasoning server forwards with a warning under a warn
+// section. Under a block section it now blocks, matching the stdio path.
 func TestRunWSProxy_MCPResponseTrustReasoningWarnsSecurityAnalysis(t *testing.T) {
 	responseSent := make(chan struct{})
 	response := []byte(makeResponse(1, reasoningPromptInjectionAnalysis))
 	srv := wsRespondServer(t, response, responseSent)
 	defer srv.Close()
 
-	sc := testScannerWithAction(t, config.ActionBlock)
+	sc := testScannerWithAction(t, config.ActionWarn)
 	pr, pw := io.Pipe()
 	var stdout, stderr lockedHTTPBuffer
 

@@ -173,8 +173,13 @@ func TestForwardScanned_PerServerSuppressionForwardsMatchingServer(t *testing.T)
 	}
 }
 
+// The section action is warn here on purpose. Trust may only make scanning
+// stricter than the enclosing response_scanning.action, so a reasoning server
+// forwards with a warning under a warn section; under a block section it
+// blocks, which TestScanResponseOpts_ReasoningTrustBlocksUnderBlockSection
+// pins.
 func TestForwardScanned_MCPResponseTrustReasoningWarnsSecurityAnalysis(t *testing.T) {
-	sc := testScannerWithAction(t, config.ActionBlock)
+	sc := testScannerWithAction(t, config.ActionWarn)
 	line := []byte(makeResponse(4, reasoningPromptInjectionAnalysis))
 	base := ScanResponse(line, sc)
 	if base.Clean {
