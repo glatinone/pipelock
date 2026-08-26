@@ -296,8 +296,8 @@ func (bp *BridgeProxy) handleConn(conn net.Conn) {
 // socket (parent's scanning proxy) rather than two same-kind connections, and
 // it runs inside the sandboxed child process, which has no reference to the
 // parent process's *killswitch.Controller - bp.done (closed by teardown, see
-// Close/fail/the ctx-cancellation watcher in Serve) is the reachable
-// equivalent of a kill-switch signal at this process boundary.
+// Close/fail/the ctx-cancellation watcher in Serve) is what this relay checks
+// instead.
 type bridgeRelay struct {
 	agent, parent net.Conn
 	idleTimeout   time.Duration

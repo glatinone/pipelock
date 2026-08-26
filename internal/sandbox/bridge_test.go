@@ -828,3 +828,31 @@ func TestBridgeProxy_CloseAndFailAreRaceSafe(t *testing.T) {
 		}
 	}
 }
+
+func TestBridgeIdleTimeoutFromEnv(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		wantOK  bool
+		wantDur time.Duration
+	}{
+		{name: "unset", raw: "", wantOK: false},
+		{name: "non-numeric", raw: "not-a-number", wantOK: false},
+		{name: "zero", raw: "0", wantOK: false},
+		{name: "negative", raw: "-5", wantOK: false},
+		{name: "positive", raw: "45", wantOK: true, wantDur: 45 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(sandboxBridgeIdleTimeoutEnv, tt.raw)
+
+			gotDur, gotOK := bridgeIdleTimeoutFromEnv()
+			if gotOK != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", gotOK, tt.wantOK)
+			}
+			if gotOK && gotDur != tt.wantDur {
+				t.Fatalf("duration = %v, want %v", gotDur, tt.wantDur)
+			}
+		})
+	}
+}
