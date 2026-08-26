@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-name: Pipelock Gauntlet Candidate
+name: Pipelock Gauntlet
 
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 env:
-  AEB_REF: 53c95da15268447709914834a716516fd682bf1d
+  AEB_REF: 2d6cb1d6e1a6d8a11b8e5a1649e7dee1c6e56aea
 
 jobs:
   candidate:

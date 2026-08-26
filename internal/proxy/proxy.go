@@ -31,6 +31,7 @@ import (
 
 	readability "github.com/go-shiori/go-readability"
 	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/authority"
 	"github.com/luckyPipewrench/pipelock/internal/blockreason"
 	"github.com/luckyPipewrench/pipelock/internal/capture"
 	"github.com/luckyPipewrench/pipelock/internal/certgen"
@@ -120,6 +121,10 @@ const (
 	// the transport that originated the request rather than the
 	// hardcoded default. See Info 2 on the envelope-signing review.
 	ctxKeyRedirectTransport
+	// ctxKeyRedirectSessionRecorder carries the exact admission-time session
+	// recorder into CheckRedirect so policy is re-evaluated against the same
+	// identity and state on every hop.
+	ctxKeyRedirectSessionRecorder
 
 	// ctxKeySSRFDialScanSnapshot carries the DNS answers from an allowed
 	// scanner SSRF pass into the later dial-time re-resolution. The safe
@@ -177,6 +182,8 @@ type blockedRequestError struct {
 	layer  string
 	reason string
 	detail string
+	target string
+	taint  *taintDecision
 }
 
 func (e *blockedRequestError) Error() string {
@@ -219,6 +226,12 @@ func newRedirectBlockedRequest(originLayer, reason string) *blockedRequestError 
 		layer = "redirect"
 	}
 	return newBlockedRequestError(layer, fullReason, fullReason)
+}
+
+func newRedirectTaintBlockedRequest(decision taintDecision, reason string) *blockedRequestError {
+	blockedErr := newRedirectBlockedRequest("taint_policy", reason)
+	blockedErr.taint = &decision
+	return blockedErr
 }
 
 func newEnvelopeBlockedRequest(err error) *blockedRequestError {
@@ -264,6 +277,19 @@ func redirectBlockedInfo(blockedErr *blockedRequestError) blockreason.Info {
 		layer = blockedErr.layer
 	}
 	return blockInfoFor(blockreason.RedirectScanDenied, layer)
+}
+
+// redirectReceiptTarget keeps redirect-denial receipts tied to the URL that
+// was actually refused. The admitted request remains available through the
+// request ID and prior audit events; recording it as the blocked target would
+// make a redirected denial look like a denial of the original destination.
+// The fallback preserves a useful target for legacy typed errors that did not
+// originate in CheckRedirect.
+func redirectReceiptTarget(blockedErr *blockedRequestError, fallback string) string {
+	if blockedErr != nil && blockedErr.target != "" {
+		return blockedErr.target
+	}
+	return fallback
 }
 
 // Regex patterns for extracting content from HTML hiding spots that
@@ -355,6 +381,7 @@ type Proxy struct {
 	redactMatcherPtr     atomic.Pointer[redact.Matcher]         // nil when redaction disabled
 	reqPolicyPtr         atomic.Pointer[reqpolicy.Matcher]      // nil when request_policy disabled
 	contractLoaderPtr    atomic.Pointer[contractruntime.Loader] // nil when learn_lock is disabled
+	authorityVerifier    authority.Verifier                     // nil preserves pre-authority forwarding behavior
 	logger               *audit.Logger
 	metrics              *metrics.Metrics
 	ks                   *killswitch.Controller
@@ -385,6 +412,8 @@ type Proxy struct {
 	wd                   *health.Watchdog                      // wedge-detection watchdog (nil = disabled)
 	metricsSuppressed    bool                                  // never publish /metrics or /stats on this listener
 	probeInflight        atomic.Bool                           // singleflight guard for scannerProbe (prevents goroutine leak when scanner wedges)
+	metricsTargetPtr     atomic.Pointer[metricsDialTarget]     // resolved metrics listener; rebuilt when MetricsListen changes
+	lookupMetricsHost    func(context.Context, string) ([]string, error)
 }
 
 // Option configures optional Proxy behavior.
@@ -449,6 +478,13 @@ func WithReceiptKeyPath(path string) Option {
 // a real loader without routing through YAML config.
 func WithContractLoader(loader *contractruntime.Loader) Option {
 	return func(p *Proxy) { p.contractLoaderPtr.Store(loader) }
+}
+
+// WithAuthorityVerifier installs the external-grant verifier used by every
+// forwarding surface. A nil verifier preserves existing behavior while still
+// consuming the reserved carrier so grants never leak upstream.
+func WithAuthorityVerifier(verifier authority.Verifier) Option {
+	return func(p *Proxy) { p.authorityVerifier = verifier }
 }
 
 // WithEnvelopeEmitter sets the mediation envelope emitter. When non-nil, the
@@ -522,6 +558,7 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 	}
 	p.cfgPtr.Store(cfg)
 	p.scannerPtr.Store(sc)
+	p.refreshMetricsDialTarget(cfg.MetricsListen)
 
 	if p.currentContractLoader() == nil {
 		loader, loaderErr := buildContractLoader(cfg)
@@ -664,12 +701,17 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 	p.client = &http.Client{
 		Transport: transport,
 		Timeout:   time.Duration(cfg.FetchProxy.TimeoutSeconds) * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		CheckRedirect: func(req *http.Request, via []*http.Request) (retErr error) {
 			if len(via) >= 5 {
 				return fmt.Errorf("too many redirects (max 5)")
 			}
 			originalURL := via[0].URL.String()
 			redirectURL := req.URL.String()
+			defer func() {
+				if blockedErr, ok := blockedRequestErrorFrom(retErr); ok && blockedErr.target == "" {
+					blockedErr.target = redirectURL
+				}
+			}()
 			clientIP, _ := req.Context().Value(ctxKeyClientIP).(string)
 			requestID, _ := req.Context().Value(ctxKeyRequestID).(string)
 			agentName, _ := req.Context().Value(ctxKeyAgent).(string)
@@ -725,6 +767,44 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 				logger.LogAnomaly(actx, result.Scanner, fmt.Sprintf("redirect from %s: %s", originalURL, result.Reason), result.Score)
 			}
 			scannerMatched := !result.Allowed
+
+			// A 307/308 redirect preserves the original method and body. A
+			// git-receive-pack POST therefore remains a push on the redirected
+			// target, which must satisfy the same repository allowlist as the
+			// admitted request.
+			if gitPush := evaluateGitPushAllowlist(currentCfg.GitProtection, req.Method, req.URL); gitPush.Block {
+				actx := newHTTPAuditContext(logger, req.Method, redirectURL, clientIP, requestID, agentName)
+				logger.LogBlocked(actx, "git_protection", "redirect from "+originalURL+" blocked: "+gitPush.Reason)
+				return newRedirectBlockedRequest("git_protection", gitPush.Reason)
+			}
+			redirectRec, _ := req.Context().Value(ctxKeyRedirectSessionRecorder).(session.Recorder)
+			redirectTaint := evaluateHTTPTaint(currentCfg, redirectRec, req.Method, req.URL)
+			if redirectTaint.Result.Decision == session.PolicyAsk || redirectTaint.Result.Decision == session.PolicyBlock {
+				actx := newHTTPAuditContext(logger, req.Method, redirectURL, clientIP, requestID, agentName)
+				logger.LogTaintDecision(actx, audit.TaintDecision{
+					TaintLevel: redirectTaint.Risk.Level.String(), ActionClass: redirectTaint.ActionClass.String(),
+					Sensitivity: redirectTaint.Sensitivity.String(), Authority: redirectTaint.Authority.String(),
+					Decision: redirectTaint.Result.Decision.String(), Reason: redirectTaint.Result.Reason,
+					SourceURL: redirectTaint.Risk.SecurityOriginURL(), SourceKind: redirectTaint.Risk.SecurityOriginKind(),
+				})
+			}
+			switch redirectTaint.Result.Decision {
+			case session.PolicyBlock:
+				return newRedirectTaintBlockedRequest(redirectTaint, redirectTaint.Result.Reason)
+			case session.PolicyAsk:
+				approved, blockReason := p.resolveTaintAsk(agentName, redirectURL, req.Method, redirectTaint.Result.Reason)
+				if !approved {
+					return newRedirectTaintBlockedRequest(redirectTaint, blockReason)
+				}
+			}
+			if redirectSess, ok := redirectRec.(*SessionState); ok && redirectSess != nil {
+				tier := airlockTierForScope(redirectSess, adaptiveScopeForHost(req.URL.Hostname()))
+				if allowed, reason := ClassifyAction(tier, req.Method, redirectTransport, false); !allowed {
+					logger.LogAirlockDeny(redirectSess.key, tier, redirectTransport, req.Method, clientIP, requestID)
+					p.metrics.RecordAirlockDenial(tier, redirectTransport, req.Method)
+					return newRedirectBlockedRequest("airlock", reason)
+				}
+			}
 
 			// request_policy runs before the contract gate so a contract
 			// allow can never suppress an operation-policy block.
@@ -1897,6 +1977,7 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 		p.cfgPtr.Store(cfg)
 		p.contractLoaderPtr.Store(contractLoader)
 	}
+	p.refreshMetricsDialTarget(cfg.MetricsListen)
 	p.disableCEE(&cfg.CrossRequestDetection)
 	if p.wd != nil {
 		p.wd.BeatConfig()
@@ -2013,6 +2094,7 @@ type ceeAdmitRequest struct {
 	SessionKey       string
 	Outbound         []byte
 	KeyPayload       []byte
+	PathPayload      *ceePathPayload
 	TargetURL        string
 	Agent            string
 	ClientIP         string
@@ -2045,8 +2127,13 @@ func (p *Proxy) admitCurrentCEE(ctx context.Context, req ceeAdmitRequest) ceeAdm
 		fb = nil
 	}
 	return ceeAdmission{
-		Result: ceeAdmit(ctx, req.SessionKey, req.Outbound, req.KeyPayload, req.TargetURL, req.Agent, req.ClientIP, req.RequestID,
-			ceeCfg, p.entropyTrackerPtr.Load(), fb, p.scannerPtr.Load(), p.logger, p.metrics),
+		Result: ceeAdmit(ctx, ceeAdmitOptions{
+			SessionKey: req.SessionKey, Outbound: req.Outbound, KeyPayload: req.KeyPayload,
+			PathPayload: req.PathPayload, TargetURL: req.TargetURL, Agent: req.Agent,
+			ClientIP: req.ClientIP, RequestID: req.RequestID, Config: ceeCfg,
+			Entropy: p.entropyTrackerPtr.Load(), Fragments: fb, Scanner: p.scannerPtr.Load(),
+			Logger: p.logger, Metrics: p.metrics,
+		}),
 		Config:         ceeCfg,
 		AdaptiveConfig: cfg.AdaptiveEnforcement,
 		Sessions:       p.sessionMgrPtr.Load(),
@@ -3127,7 +3214,7 @@ func (p *Proxy) applyShield(body []byte, contentType, hostname string, respHeade
 			p.logger.LogAnomaly(actx, "shield_oversize", fmt.Sprintf("response body %d bytes exceeds max_shield_bytes %d", len(body), cfg.BrowserShield.MaxShieldBytes), 0)
 			return body, nil, false
 		default: // block: fail-closed, return 403
-			p.logger.LogBlocked(actx, "shield_oversize", fmt.Sprintf("response body %d bytes exceeds max_shield_bytes %d (action: block)", len(body), cfg.BrowserShield.MaxShieldBytes))
+			p.logger.LogBlocked(actx, "shield_oversize", shieldOversizeBlockReason(hostname, len(body), cfg.BrowserShield.MaxShieldBytes))
 			return nil, nil, true
 		}
 	}
@@ -3509,6 +3596,181 @@ func blockIfNonOverridableSSRFTarget(ctx context.Context, host string, ip net.IP
 	return nil
 }
 
+// metricsHostnameLookupTimeout bounds the one lookup used to resolve a
+// hostname MetricsListen value. The result is cached for that listen
+// string so the hot dial path never blocks on DNS.
+const metricsHostnameLookupTimeout = time.Second
+
+var errMetricsHostnameNoIPs = errors.New("hostname resolved to no IP addresses")
+
+// errMetricsTargetUnpublished marks a dial reaching the guard before the
+// resolved metrics target was published, or after the published one stopped
+// matching the configured listener. The dial path does not resolve, so this
+// state is reported as unverifiable rather than treated as permission.
+var errMetricsTargetUnpublished = errors.New("metrics listener target not published for the configured listen address")
+
+// metricsDialTarget is the resolved metrics listener compared against each
+// dial. It is published at config load, at reload, and when the listener
+// reports the address it actually bound; it is never built on the dial path.
+// There is no TTL: the metrics socket is bound once for a given listen string,
+// and re-resolving on a timer would stop blocking the bound address if DNS
+// later moved.
+//
+// bound records that this snapshot came from a real listener bind rather than
+// from parsing the configured string. That distinction is load-bearing when the
+// configured port is 0, because the configured form carries no port at all and
+// rebuilding from it would discard the only value that can match a dial.
+type metricsDialTarget struct {
+	listen      string
+	port        uint16
+	unspecified bool
+	ips         []net.IP
+	resolveErr  error
+	bound       bool
+}
+
+func configuredMetricsBlockDetail(host, port string) string {
+	return fmt.Sprintf("SSRF blocked: %s:%s is the configured metrics listener", host, port)
+}
+
+func unverifiedMetricsBlockDetail(host, port, kind string, err error) string {
+	return fmt.Sprintf("SSRF blocked: cannot verify whether %s:%s reaches the %s metrics listener: %v", host, port, kind, err)
+}
+
+func (p *Proxy) metricsHostLookup() func(context.Context, string) ([]string, error) {
+	if p != nil && p.lookupMetricsHost != nil {
+		return p.lookupMetricsHost
+	}
+	return net.DefaultResolver.LookupHost
+}
+
+func (p *Proxy) refreshMetricsDialTarget(listen string) {
+	if p == nil {
+		return
+	}
+	if listen == "" {
+		p.metricsTargetPtr.Store(nil)
+		return
+	}
+	// A reload that leaves metrics_listen unchanged must not replace a target
+	// that came from a real bind. With a configured port of 0 the rebuilt
+	// target carries port 0, the dial guard treats port 0 as nothing to match,
+	// and an unrelated reload would silently reopen the metrics listener to
+	// every mediated transport. The listener is only rebound when the address
+	// changes, and that path publishes its own target.
+	if cached := p.metricsTargetPtr.Load(); cached != nil && cached.bound && cached.listen == listen {
+		return
+	}
+	p.metricsTargetPtr.Store(p.buildMetricsDialTarget(listen))
+}
+
+// UpdateMetricsDialTargetFromBoundAddr replaces a hostname-derived metrics
+// target with the numeric address the metrics listener actually bound. The
+// listener resolves a hostname independently from config load, so retaining
+// the earlier lookup could leave the dial guard comparing against a stale IP.
+func (p *Proxy) UpdateMetricsDialTargetFromBoundAddr(addr string) {
+	if p == nil {
+		return
+	}
+	cfg := p.CurrentConfig()
+	if cfg == nil || cfg.MetricsListen == "" {
+		p.metricsTargetPtr.Store(nil)
+		return
+	}
+	target := p.buildMetricsDialTarget(addr)
+	if target == nil {
+		_, configuredPort, configuredErr := net.SplitHostPort(cfg.MetricsListen)
+		port, portErr := strconv.Atoi(configuredPort)
+		if configuredErr == nil && portErr == nil && port > 0 && port <= 65535 {
+			p.metricsTargetPtr.Store(&metricsDialTarget{
+				listen:     cfg.MetricsListen,
+				port:       uint16(port),
+				resolveErr: fmt.Errorf("parse bound metrics listener %q", addr),
+				bound:      true,
+			})
+			return
+		}
+		p.metricsTargetPtr.Store(nil)
+		return
+	}
+	target.listen = cfg.MetricsListen
+	target.bound = true
+	p.metricsTargetPtr.Store(target)
+}
+
+// cachedMetricsDialTarget returns the published snapshot for listen. It never
+// builds one, because building resolves a hostname and this runs on the dial
+// path for every mediated request: doing that work here would block the request
+// for up to the lookup timeout, and concurrent misses would each repeat it,
+// which is a denial-of-service shape rather than a guard. A snapshot that is
+// missing or belongs to a different listen string means the published state is
+// stale, so the target reports itself unverifiable and the guard blocks, which
+// matches how an unresolvable hostname is already handled.
+func (p *Proxy) cachedMetricsDialTarget(listen string) *metricsDialTarget {
+	if cached := p.metricsTargetPtr.Load(); cached != nil && cached.listen == listen {
+		return cached
+	}
+	_, configuredPort, splitErr := net.SplitHostPort(listen)
+	if splitErr != nil {
+		return nil
+	}
+	port, portErr := strconv.Atoi(configuredPort)
+	if portErr != nil || port < 1 || port > 65535 {
+		return nil
+	}
+	return &metricsDialTarget{
+		listen:     listen,
+		port:       uint16(port),
+		resolveErr: errMetricsTargetUnpublished,
+	}
+}
+
+func (p *Proxy) buildMetricsDialTarget(listen string) *metricsDialTarget {
+	metricsHost, metricsPort, err := net.SplitHostPort(listen)
+	if err != nil {
+		return nil
+	}
+	wantPort, wantErr := strconv.Atoi(metricsPort)
+	target := &metricsDialTarget{listen: listen}
+	if wantErr != nil || wantPort < 1 || wantPort > 65535 {
+		return target
+	}
+	target.port = uint16(wantPort)
+	metricsIP := net.ParseIP(metricsHost)
+	if strings.TrimSpace(metricsHost) == "" || (metricsIP != nil && metricsIP.IsUnspecified()) {
+		target.unspecified = true
+		return target
+	}
+	if metricsIP != nil {
+		if v4 := metricsIP.To4(); v4 != nil {
+			metricsIP = v4
+		}
+		target.ips = []net.IP{metricsIP}
+		return target
+	}
+	lookupCtx, cancel := context.WithTimeout(context.Background(), metricsHostnameLookupTimeout)
+	defer cancel()
+	addrs, lookupErr := p.metricsHostLookup()(lookupCtx, metricsHost)
+	if lookupErr != nil {
+		target.resolveErr = lookupErr
+		return target
+	}
+	for _, addr := range addrs {
+		ip := net.ParseIP(addr)
+		if ip == nil {
+			continue
+		}
+		if v4 := ip.To4(); v4 != nil {
+			ip = v4
+		}
+		target.ips = append(target.ips, ip)
+	}
+	if len(target.ips) == 0 {
+		target.resolveErr = errMetricsHostnameNoIPs
+	}
+	return target
+}
+
 // blockIfConfiguredMetricsTarget keeps the contained agent from using a broad
 // SSRF exception to query the proxy's own metrics listener. This check belongs
 // in the dial path, before trusted-domain, IP-allowlist, and grant exceptions,
@@ -3518,36 +3780,33 @@ func (p *Proxy) blockIfConfiguredMetricsTarget(ctx context.Context, host, port s
 	if cfg == nil || cfg.MetricsListen == "" {
 		return nil
 	}
-	metricsHost, metricsPort, err := net.SplitHostPort(cfg.MetricsListen)
-	if err != nil {
+	target := p.cachedMetricsDialTarget(cfg.MetricsListen)
+	if target == nil {
 		return nil
 	}
-	wantPort, wantErr := strconv.ParseUint(metricsPort, 10, 16)
 	gotPort, gotErr := strconv.ParseUint(port, 10, 16)
-	if wantErr != nil || gotErr != nil || wantPort == 0 || wantPort != gotPort || ip == nil {
+	if gotErr != nil || target.port == 0 || target.port != uint16(gotPort) || ip == nil {
 		return nil
 	}
-	metricsIP := net.ParseIP(metricsHost)
-	if strings.TrimSpace(metricsHost) == "" || (metricsIP != nil && metricsIP.IsUnspecified()) {
+	if target.unspecified {
 		local, localErr := isLocalInterfaceIP(ip)
 		if localErr != nil {
-			return newSSRFDialBlockError(ctx, host, ip, fmt.Sprintf("SSRF blocked: cannot verify whether %s:%s reaches the wildcard metrics listener: %v", host, port, localErr))
+			return newSSRFDialBlockError(ctx, host, ip, unverifiedMetricsBlockDetail(host, port, "wildcard", localErr))
 		}
 		if !local {
 			return nil
 		}
-		return newSSRFDialBlockError(ctx, host, ip, fmt.Sprintf("SSRF blocked: %s:%s is the configured metrics listener", host, port))
+		return newSSRFDialBlockError(ctx, host, ip, configuredMetricsBlockDetail(host, port))
 	}
-	if metricsIP == nil {
-		return nil
+	if target.resolveErr != nil {
+		return newSSRFDialBlockError(ctx, host, ip, unverifiedMetricsBlockDetail(host, port, "hostname", target.resolveErr))
 	}
-	if metricsV4 := metricsIP.To4(); metricsV4 != nil {
-		metricsIP = metricsV4
+	for _, metricsIP := range target.ips {
+		if metricsIP.Equal(ip) {
+			return newSSRFDialBlockError(ctx, host, ip, configuredMetricsBlockDetail(host, port))
+		}
 	}
-	if !metricsIP.Equal(ip) {
-		return nil
-	}
-	return newSSRFDialBlockError(ctx, host, ip, fmt.Sprintf("SSRF blocked: %s:%s is the configured metrics listener", host, port))
+	return nil
 }
 
 func isLocalInterfaceIP(ip net.IP) (bool, error) {
@@ -3978,6 +4237,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// Strip inbound mediation envelope headers after optional trust
 	// verification so forged mediation metadata cannot survive to upstreams.
 	envelope.StripInbound(r.Header)
+	authorityRef, authorityCarrierErr := consumeAuthorityHeader(r)
 	agentLabel := id.Profile // bounded cardinality for Prometheus labels
 	sc, releaseScanner, scOK := p.pinResolvedScanner(resolved)
 	defer releaseScanner()
@@ -4103,7 +4363,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// RecordClean at the end when no finding was detected.
 	var fetchRec session.Recorder
 	if sm := p.sessionMgrPtr.Load(); sm != nil {
-		fetchRec = sm.GetOrCreate(sessionKeyFor(agent, clientIP))
+		fetchRec = sm.GetOrCreate(responseTaintSessionKey(agent, clientIP, id.Auth))
 	}
 	fetchTaint := evaluateHTTPTaint(cfg, fetchRec, http.MethodGet, parsed)
 
@@ -4473,7 +4733,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// GET-only so the outbound data is the target URL path and query values.
 	admission := p.admitCurrentCEE(r.Context(), ceeAdmitRequest{
 		SessionKey: ceeSessionKey(agent, clientIP, id.Auth), Outbound: urlPayload(parsed),
-		KeyPayload: queryParamKeys(parsed), TargetURL: displayURL, Agent: agent, ClientIP: clientIP,
+		KeyPayload: queryParamKeys(parsed), PathPayload: pathSegments(parsed), TargetURL: displayURL, Agent: agent, ClientIP: clientIP,
 		RequestID: requestID, IncludeFragments: true,
 	})
 	if admission.Active {
@@ -4676,6 +4936,44 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if err := p.authorizeForward(r.Context(), authorityRef, authorityCarrierErr, authority.Request{
+		Actor:       agent,
+		Action:      string(receipt.ActionRead),
+		Destination: targetURL,
+	}, actx, TransportFetch); err != nil {
+		const reason = "authority verification failed"
+		p.recordDecision(config.ActionBlock, blockLayerAuthority, reason, TransportFetch, requestID)
+		emitFetchReceipt(receipt.EmitOpts{
+			ActionID:            actionID,
+			Verdict:             config.ActionBlock,
+			Layer:               blockLayerAuthority,
+			Pattern:             reason,
+			Transport:           TransportFetch,
+			Method:              http.MethodGet,
+			Target:              displayURL,
+			RequestID:           requestID,
+			Agent:               agent,
+			SessionTaintLevel:   fetchTaint.Risk.Level.String(),
+			SessionContaminated: fetchTaint.Risk.Contaminated,
+			RecentTaintSources:  fetchTaint.Risk.Sources,
+			SessionTaskID:       fetchTaint.Task.CurrentTaskID,
+			SessionTaskLabel:    fetchTaint.Task.CurrentTaskLabel,
+			AuthorityKind:       fetchTaint.Authority.String(),
+			TaintDecision:       fetchTaint.Result.Decision.String(),
+			TaintDecisionReason: fetchTaint.Result.Reason,
+			TaskOverrideApplied: fetchTaint.TaskOverrideApplied,
+		})
+		p.metrics.RecordBlocked(parsed.Hostname(), blockLayerAuthority, time.Since(start), agentLabel)
+		writeBlockedJSON(w,
+			blockInfoFor(blockreason.AuthorityMismatch, blockLayerAuthority),
+			http.StatusForbidden, FetchResponse{
+				URL:         displayURL,
+				Agent:       agent,
+				Blocked:     true,
+				BlockReason: "authority verification failed",
+			})
+		return
+	}
 
 	// Fetch the URL - attach clientIP/requestID/agent and resolved agent
 	// config/scanner to context for redirect logging and per-agent redirect enforcement.
@@ -4686,6 +4984,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	ctx = context.WithValue(ctx, ctxKeyAgentScanner, sc)
 	ctx = context.WithValue(ctx, ctxKeyAgentContractLoader, snapshotContractLoader)
 	ctx = context.WithValue(ctx, ctxKeyRedirectTransport, TransportFetch)
+	ctx = context.WithValue(ctx, ctxKeyRedirectSessionRecorder, fetchRec)
 	ctx = withAllowedSSRFDialScanSnapshot(ctx, sc, parsed.Hostname(), effectiveURLPort(parsed), result)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
@@ -4849,6 +5148,10 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		if blockedErr, ok := blockedRequestErrorFrom(err); ok {
 			log.LogBlocked(actx, blockedErr.layer, blockedErr.detail)
 			p.metrics.RecordBlocked(parsed.Hostname(), blockedErr.layer, time.Since(start), agentLabel)
+			redirectTaint := fetchTaint
+			if blockedErr.taint != nil {
+				redirectTaint = *blockedErr.taint
+			}
 			resp := FetchResponse{
 				URL:         displayURL,
 				Agent:       agent,
@@ -4865,15 +5168,24 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				resp.Hint = "Request was redirected to a different origin. Cross-origin redirects are blocked to prevent open redirect attacks."
 			}
 			emitFetchReceipt(receipt.EmitOpts{
-				ActionID:  actionID,
-				Verdict:   config.ActionBlock,
-				Layer:     blockedErr.layer,
-				Pattern:   blockedErr.reason,
-				Transport: "fetch",
-				Method:    http.MethodGet,
-				Target:    displayURL,
-				RequestID: requestID,
-				Agent:     agent,
+				ActionID:            actionID,
+				Verdict:             config.ActionBlock,
+				Layer:               blockedErr.layer,
+				Pattern:             blockedErr.reason,
+				Transport:           "fetch",
+				Method:              http.MethodGet,
+				Target:              redirectReceiptTarget(blockedErr, displayURL),
+				RequestID:           requestID,
+				Agent:               agent,
+				SessionTaintLevel:   redirectTaint.Risk.Level.String(),
+				SessionContaminated: redirectTaint.Risk.Contaminated,
+				RecentTaintSources:  redirectTaint.Risk.Sources,
+				SessionTaskID:       redirectTaint.Task.CurrentTaskID,
+				SessionTaskLabel:    redirectTaint.Task.CurrentTaskLabel,
+				AuthorityKind:       redirectTaint.Authority.String(),
+				TaintDecision:       redirectTaint.Result.Decision.String(),
+				TaintDecisionReason: redirectTaint.Result.Reason,
+				TaskOverrideApplied: redirectTaint.TaskOverrideApplied,
 			})
 			writeBlockedJSON(w,
 				redirectBlockedInfo(blockedErr),
@@ -5025,14 +5337,16 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// Use the final response origin (after redirects), not the original request
 	// URL. An exempt origin that 302s to a non-exempt host must still be shielded.
 	shieldHost := resp.Request.URL.Hostname()
+	shieldBodyLen := len(body)
 	body, _, shieldBlocked := p.applyShield(body, contentType, shieldHost, resp.Header, cfg, actx, clientIP, requestID, TransportFetch, actionID)
 	if shieldBlocked {
+		reason := shieldOversizeBlockReason(shieldHost, shieldBodyLen, cfg.BrowserShield.MaxShieldBytes)
 		p.metrics.RecordBlocked(parsed.Hostname(), "shield_oversize", time.Since(start), agentLabel)
 		emitFetchReceipt(receipt.EmitOpts{
 			ActionID:  actionID,
 			Verdict:   config.ActionBlock,
 			Layer:     "shield_oversize",
-			Pattern:   "response body exceeds browser shield size limit",
+			Pattern:   reason,
 			Transport: "fetch",
 			Method:    http.MethodGet,
 			Target:    displayURL,
@@ -5043,7 +5357,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			blockInfoFor(blockreason.BrowserShieldOversize, "shield_oversize"),
 			http.StatusForbidden, FetchResponse{
 				URL: displayURL, Agent: agent, Blocked: true,
-				BlockReason: "response body exceeds browser shield size limit",
+				BlockReason: reason,
 			})
 		outcomeStatus = strconv.Itoa(http.StatusForbidden)
 		outcomeBytes = int64(len(body))
@@ -5114,6 +5428,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			// Exempt domains: scan for visibility but pin to warn, no adaptive scoring.
 			blocked, _, found := p.filterAndActOnResponseScan(w, rawResult, content, displayURL, agent, clientIP, requestID, actionID, sc, cfg, log, recEscalationLevel(fetchRec), responseScanExempt)
 			if blocked {
+				p.metrics.RecordBlocked(parsed.Hostname(), "response_scan", time.Since(start), agentLabel)
 				outcomeStatus = strconv.Itoa(http.StatusForbidden)
 				outcomeBytes = int64(len(body))
 				outcomeReason = "response_scan"

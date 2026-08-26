@@ -90,7 +90,17 @@ fi
 
 PASS=0
 FAIL=0
+SKIP=0
 FAILED_TESTS=()
+SKIPPED_TESTS=()
+
+# skip <description> <reason>: records an assertion this host cannot run. The
+# reason is printed and summarized so a skipped check never reads as coverage.
+skip() {
+  SKIP=$((SKIP + 1))
+  SKIPPED_TESTS+=("$1 ($2)")
+  echo "  SKIP  $1 ($2)"
+}
 
 assert() {
   local desc="$1"
@@ -102,6 +112,40 @@ assert() {
     FAIL=$((FAIL + 1))
     FAILED_TESTS+=("$desc")
     echo "  FAIL  $desc"
+  fi
+}
+
+# Config discovery ends at a compiled-in system path that no environment
+# variable can suppress, so a host carrying a usable config there cannot
+# exercise the nothing-discoverable branch. Decide that from what the
+# invocation actually did rather than by probing the host: a separate probe
+# races the invocation, and reproducing discovery's regular-file and
+# permission predicate in shell would be a second copy of a security check
+# that is free to drift from the real one. The command reports exactly one of
+# the two outcomes on stderr, so the outcome itself says whether the branch
+# ran.
+assert_no_discovery_warning() {
+  local stderr_file="$1"
+  local desc="install stderr warns when no pipelock config is discoverable"
+  local warned discovered config
+  # Anchored whole-line matches against the two documented outcomes. A
+  # substring match would accept the phrase inside unrelated output, and
+  # matching only a line prefix would accept a truncated or malformed line.
+  warned=$(grep -c '^warning: no pipelock config found at PIPELOCK_CONFIG, .*to enable scanning\.$' "$stderr_file" || true)
+  discovered=$(grep -c '^Using config .* for the wrapped MCP proxy\.$' "$stderr_file" || true)
+  # Exactly one outcome is the only readable result. Both means the run
+  # contradicted itself and neither means the command said something we do not
+  # recognise; either way the outcome is unknown, and an unknown outcome fails
+  # rather than skipping, because a skip would record it as deliberately
+  # uncovered when in fact it was not understood.
+  if [ "$warned" -eq 1 ] && [ "$discovered" -eq 0 ]; then
+    assert "$desc" true
+  elif [ "$discovered" -eq 1 ] && [ "$warned" -eq 0 ]; then
+    config=$(sed -n 's/^Using config \(.*\) for the wrapped MCP proxy\.$/\1/p' "$stderr_file")
+    skip "$desc" "$config was discoverable on this host"
+  else
+    echo "    unreadable discovery outcome: warned=$warned discovered=$discovered" >&2
+    assert "$desc" false
   fi
 }
 
@@ -185,8 +229,7 @@ PIPELOCK_CONFIG="" XDG_CONFIG_HOME="$WORKDIR/empty-xdg" HOME="$E2E_HOME" \
   "$PIPELOCK" opencode install --path "$CONFIG" >"$WORKDIR/install.stdout" 2>"$WORKDIR/install.stderr"
 assert "install exit 0" test -s "$WORKDIR/install.stdout"
 assert "install stdout reports 2 wrapped" grep -q "Wrapped 2 server(s)" "$WORKDIR/install.stdout"
-assert "install stderr warns when no pipelock config is discoverable" \
-  grep -q "no pipelock config found" "$WORKDIR/install.stderr"
+assert_no_discovery_warning "$WORKDIR/install.stderr"
 
 echo ""
 echo "[1b] install honors auto-discovery"
@@ -304,6 +347,15 @@ echo ""
 echo "=== Summary ==="
 echo "PASS: $PASS"
 echo "FAIL: $FAIL"
+echo "SKIP: $SKIP"
+
+if [[ $SKIP -gt 0 ]]; then
+  echo ""
+  echo "Skipped assertions (not covered on this host):"
+  for t in "${SKIPPED_TESTS[@]}"; do
+    echo "  - $t"
+  done
+fi
 
 if [[ $FAIL -gt 0 ]]; then
   echo ""

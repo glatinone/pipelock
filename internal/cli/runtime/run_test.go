@@ -1220,7 +1220,10 @@ func TestRunCmd_MCPListenerResponseTrustReasoning(t *testing.T) {
 mode: balanced
 response_scanning:
   enabled: true
-  action: block
+  # warn on purpose: trust may only tighten, so reasoning forwards with a
+  # warning here. Under a block section it now blocks, which the config and
+  # scan-gate tests pin.
+  action: warn
   mcp_servers:
     - server: codex
       trust: reasoning

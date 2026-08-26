@@ -14,10 +14,11 @@ import pytest
 
 from pipelock_aarp_verify.provenance import (
     PROFILE_DIGEST,
+    PROFILE_DIGEST_V2,
     UNICODE_VERSION,
     ProvenanceError,
     Recipe,
-    supported_operation_kinds,
+    supported_operation_kinds_for_profile,
 )
 
 CORPUS = (
@@ -27,6 +28,7 @@ CORPUS = (
     / "transform-profile"
     / "evidence-provenance-v1.json"
 )
+CORPUS_V2 = CORPUS.with_name("evidence-provenance-v2.json")
 
 
 def test_evidence_provenance_uses_profile_pinned_unicode_database() -> None:
@@ -99,9 +101,33 @@ def test_evidence_provenance_transform_corpus() -> None:
             for op in vector.get("recipe", [])[: len(vector.get("operations", []))]
         }
     assert (
-        covered == set(supported_operation_kinds()) == set(corpus["operation_coverage"])
+        covered
+        == set(supported_operation_kinds_for_profile(PROFILE_DIGEST))
+        == set(corpus["operation_coverage"])
     )
     assert errors == set(corpus["error_coverage"])
+
+
+def test_evidence_provenance_transform_v2_corpus() -> None:
+    corpus = json.loads(CORPUS_V2.read_text())
+    assert corpus["profile_digest"] == PROFILE_DIGEST_V2
+    for vector in corpus["vectors"]:
+        recipe = Recipe.from_json(
+            vector.get("transform_profile_digest", corpus["profile_digest"]),
+            vector.get("recipe", []),
+        )
+        if vector.get("want_error"):
+            # Assert literal containment. pytest.raises(match=...) is a REGEX,
+            # so an expectation such as "recipe operation 0 (percent_decode):"
+            # reads its parentheses as a group and silently fails to match the
+            # very message it names, while accepting messages it should not.
+            with pytest.raises(ProvenanceError) as excinfo:
+                recipe.apply_bytes(base64.b64decode(vector["input_b64"], validate=True))
+            assert vector["want_error"] in str(excinfo.value)
+            continue
+        assert recipe.apply_bytes(
+            base64.b64decode(vector["input_b64"], validate=True)
+        ).encode() == base64.b64decode(vector["output_b64"], validate=True)
 
 
 @pytest.mark.parametrize(
@@ -111,6 +137,11 @@ def test_evidence_provenance_transform_corpus() -> None:
         ("bad", [], "invalid SHA-256 digest"),
         ("sha256:" + "0" * 64, [], "unknown profile"),
         (PROFILE_DIGEST, None, "operations must be an array"),
+        (
+            PROFILE_DIGEST,
+            [{"kind": "ascii_alphanumeric_strip"}],
+            "unsupported by transform profile",
+        ),
         (PROFILE_DIGEST, [{"kind": "identity", "extra": 1}], "unknown operation field"),
         (
             PROFILE_DIGEST,

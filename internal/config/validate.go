@@ -2585,6 +2585,12 @@ func (c *Config) validateSuppress() error {
 		if s.Rule == "" {
 			return fmt.Errorf("suppress entry %d missing required field \"rule\"", i)
 		}
+		if IsCoreDLPPatternName(s.Rule) {
+			return fmt.Errorf("suppress entry %d rule %q targets a core floor pattern; core floor patterns cannot be suppressed: dlp.patterns[].exempt_domains applies only to configurable URL DLP patterns, so fix this core pattern's precision", i, s.Rule)
+		}
+		if IsCoreResponsePatternName(s.Rule) {
+			return fmt.Errorf("suppress entry %d rule %q targets a core floor pattern; core floor patterns cannot be suppressed: tighten the response pattern to fix the false positive", i, s.Rule)
+		}
 		if s.Path == "" {
 			return fmt.Errorf("suppress entry %d (%s) missing required field \"path\"", i, s.Rule)
 		}
@@ -2597,6 +2603,13 @@ func (c *Config) validateSuppress() error {
 		}
 	}
 	return nil
+}
+
+// ValidateSuppressions validates the suppression surface independently of the
+// full config. Runtime boundaries use it when callers provide an in-memory
+// config that did not pass through Load.
+func (c *Config) ValidateSuppressions() error {
+	return c.validateSuppress()
 }
 
 func (c *Config) validateKillSwitch() error {
@@ -3226,6 +3239,12 @@ func (c *Config) validateReverseProxy() error {
 	}
 	if c.ReverseProxy.Listen == "" {
 		return fmt.Errorf("reverse_proxy.listen is required when reverse_proxy is enabled")
+	}
+	if c.ReverseProxy.MaxInflightScanBytes <= 0 {
+		return fmt.Errorf("reverse_proxy.max_inflight_scan_bytes must be positive when reverse_proxy is enabled")
+	}
+	if c.RequestBodyScanning.Enabled && c.ReverseProxy.MaxInflightScanBytes < c.RequestBodyScanning.MaxBodyBytes {
+		return fmt.Errorf("reverse_proxy.max_inflight_scan_bytes must be >= request_body_scanning.max_body_bytes when request body scanning is enabled")
 	}
 	return c.validateReverseProxyProfile(u)
 }

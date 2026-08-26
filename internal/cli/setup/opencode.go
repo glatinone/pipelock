@@ -84,6 +84,7 @@ Already-wrapped servers are skipped (idempotent). A .bak backup is created
 before modification. Non-server fields are preserved.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Args:          cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runOpenCodeInstall(cmd, path, dryRun, configFile)
 		},
@@ -110,6 +111,7 @@ wrapped by pipelock install. Original server configurations are restored from
 the _pipelock metadata field. Non-wrapped servers are left unchanged.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Args:          cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runOpenCodeRemove(cmd, path, dryRun)
 		},
@@ -176,10 +178,11 @@ func runOpenCodeInstall(cmd *cobra.Command, override string, dryRun bool, config
 	skipped := 0
 	var sidecarOps []sidecarOp
 	for name, server := range mcpCfg.Servers {
-		if isVscodeWrapped(server) {
+		if isWrappedBySelf(server) {
 			skipped++
 			continue
 		}
+		warnForeignWrapper(cmd.ErrOrStderr(), name, server)
 
 		newServer, meta, plan, err := wrapOpenCodeServer(server, exe, configFile, targetPath, name)
 		if err != nil {
@@ -263,11 +266,12 @@ func runOpenCodeRemove(cmd *cobra.Command, override string, dryRun bool) error {
 	unwrapped := 0
 	var sidecarOps []sidecarOp
 	for name, server := range mcpCfg.Servers {
-		if !isVscodeWrapped(server) {
+		if !isRestorableWrapper(server) {
+			warnUnrestorableWrapper(cmd.ErrOrStderr(), name, server)
 			continue
 		}
 
-		restored, plan, err := unwrapOpenCodeServer(server)
+		restored, plan, err := unwrapOpenCodeServer(server, targetPath, name)
 		if err != nil {
 			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not unwrap %q: %v\n", name, err)
 			continue
@@ -430,7 +434,14 @@ func wrapOpenCodeServer(server map[string]interface{}, exe, configFile, targetCo
 	}
 }
 
-func unwrapOpenCodeServer(server map[string]interface{}) (map[string]interface{}, *sidecarOp, error) {
+// unwrapOpenCodeServer restores a server from its pipelock metadata. The
+// delete target is DERIVED from targetConfigPath and serverName rather than
+// read from the metadata: the marker lives in an operator-editable config, and
+// every server's sidecar shares one directory, so a metadata-supplied path
+// would let one server's config nominate another server's credential file for
+// deletion. The metadata path is still shape-checked so a tampered marker
+// fails closed, but it never selects the file removed.
+func unwrapOpenCodeServer(server map[string]interface{}, targetConfigPath, serverName string) (map[string]interface{}, *sidecarOp, error) {
 	metaRaw, ok := server[mcpFieldPipelock]
 	if !ok {
 		return server, nil, nil
@@ -447,7 +458,10 @@ func unwrapOpenCodeServer(server map[string]interface{}) (map[string]interface{}
 
 	var plan *sidecarOp
 	if meta.HeaderSidecarPath != "" {
-		path, err := validatedHeaderSidecarDeletePath(meta.HeaderSidecarPath)
+		if _, err := validatedHeaderSidecarDeletePath(meta.HeaderSidecarPath); err != nil {
+			return nil, nil, err
+		}
+		path, err := headerSidecarPath(targetConfigPath, serverName)
 		if err != nil {
 			return nil, nil, err
 		}

@@ -29,6 +29,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/contract"
 	"github.com/luckyPipewrench/pipelock/internal/contract/runtime/contractruntimetest"
+	"github.com/luckyPipewrench/pipelock/internal/filesentry"
 	mcptools "github.com/luckyPipewrench/pipelock/internal/mcp/tools"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/proxy"
@@ -1302,6 +1303,123 @@ func TestServer_StartArmsFileSentry(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("Start did not return within 5s of Shutdown")
+	}
+}
+
+func TestServer_StartReturnsFileSentryRuntimeFailure(t *testing.T) {
+	wantErr := errors.New("watch backend failed")
+	watcher := newGatedFileSentryWatcher(wantErr)
+	installGatedFileSentryWatcher(t, watcher)
+
+	cfgPath := writeServerTestConfig(t, strings.Join([]string{
+		"mode: balanced",
+		"file_sentry:",
+		"  enabled: true",
+		"  watch_paths:",
+		"    - " + strconv.Quote(t.TempDir()),
+		"",
+	}, "\n"))
+	s, buf := newTestServer(t, func(o *ServerOpts) {
+		o.ConfigFile = cfgPath
+		o.Listen = serverTestEphemeralListen
+		o.ListenChanged = true
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- s.Start(context.Background()) }()
+	select {
+	case <-watcher.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("file sentry watcher did not start")
+	}
+	waitForServerOutput(t, buf, "  Health:")
+	close(watcher.release)
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("Start error = %v, want file sentry runtime failure wrapping %v", err, wantErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return after file sentry runtime failure")
+	}
+}
+
+func TestServer_StartKeepsCleanCancellationNilWithFileSentry(t *testing.T) {
+	watcher := newGatedFileSentryWatcher(errors.New("must not be returned after clean cancellation"))
+	installGatedFileSentryWatcher(t, watcher)
+
+	cfgPath := writeServerTestConfig(t, strings.Join([]string{
+		"mode: balanced",
+		"file_sentry:",
+		"  enabled: true",
+		"  watch_paths:",
+		"    - " + strconv.Quote(t.TempDir()),
+		"",
+	}, "\n"))
+	s, buf := newTestServer(t, func(o *ServerOpts) {
+		o.ConfigFile = cfgPath
+		o.Listen = serverTestEphemeralListen
+		o.ListenChanged = true
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- s.Start(context.Background()) }()
+	select {
+	case <-watcher.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("file sentry watcher did not start")
+	}
+	waitForServerOutput(t, buf, "  Health:")
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Start error after clean Shutdown = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return after Shutdown")
+	}
+}
+
+func TestServer_StartKeepsFileSentryBlockCancellationNil(t *testing.T) {
+	watcher := newGatedFileSentryWatcher(errors.New("must not be returned after a file sentry block"))
+	installGatedFileSentryWatcher(t, watcher)
+
+	cfgPath := writeServerTestConfig(t, strings.Join([]string{
+		"mode: balanced",
+		"file_sentry:",
+		"  enabled: true",
+		"  action: block",
+		"  watch_paths:",
+		"    - " + strconv.Quote(t.TempDir()),
+		"",
+	}, "\n"))
+	s, buf := newTestServer(t, func(o *ServerOpts) {
+		o.ConfigFile = cfgPath
+		o.Listen = serverTestEphemeralListen
+		o.ListenChanged = true
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- s.Start(context.Background()) }()
+	select {
+	case <-watcher.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("file sentry watcher did not start")
+	}
+	waitForServerOutput(t, buf, "  Health:")
+	watcher.findings <- filesentry.Finding{Path: "agent-output", PatternName: "test", Severity: "high", IsAgent: true}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Start error after file sentry block cancellation = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return after file sentry block cancellation")
 	}
 }
 
@@ -2796,7 +2914,7 @@ func TestFilterAllowedRuleBundleCoverageWarningsKeepsLocalResponseWeakening(t *t
 }
 
 // TestServer_StartupPartialStandardBundleKeepsResponseFallback proves the
-// per-surface fix (AF-81 / CodeRabbit): a standard bundle that provides ONLY
+// per-surface fix from review: a standard bundle that provides ONLY
 // DLP patterns must NOT empty the response-scanning surface. Before the fix a
 // single "standard bundle loaded" flag stripped the compiled response fallback
 // and left response scanning empty (a fail-open detection loss).
@@ -2981,7 +3099,7 @@ func TestServer_Reload_StrictRejectsSuppressWidening(t *testing.T) {
 	buf.reset()
 	newCfg := oldCfg.Clone()
 	newCfg.Suppress = append(newCfg.Suppress, config.SuppressEntry{
-		Rule:   "Prompt Injection",
+		Rule:   "New Instructions",
 		Path:   "*",
 		Reason: "review repro",
 	})
@@ -3001,6 +3119,33 @@ func TestServer_Reload_StrictRejectsSuppressWidening(t *testing.T) {
 	}
 	if !buf.contains("suppress") {
 		t.Fatalf("stderr missing suppress widening warning:\n%s", buf.String())
+	}
+}
+
+func TestServer_ReloadRejectsCoreFloorSuppressAndPreservesRuntime(t *testing.T) {
+	s, _ := newTestServer(t, nil)
+	oldCfg := s.proxy.CurrentConfig()
+	oldScanner := s.proxy.ScannerPtr().Load()
+
+	newCfg := oldCfg.Clone()
+	newCfg.Suppress = append(newCfg.Suppress, config.SuppressEntry{
+		Rule:   "AWS Access ID",
+		Path:   "*",
+		Reason: "injected after validation",
+	})
+
+	err := s.Reload(newCfg)
+	if err == nil {
+		t.Fatal("Reload accepted core floor suppression")
+	}
+	if !strings.Contains(err.Error(), "core floor patterns cannot be suppressed") {
+		t.Fatalf("Reload error = %q, want core floor rejection", err)
+	}
+	if s.proxy.CurrentConfig() != oldCfg {
+		t.Fatal("live config changed after rejected core floor suppression")
+	}
+	if s.proxy.ScannerPtr().Load() != oldScanner {
+		t.Fatal("live scanner changed after rejected core floor suppression")
 	}
 }
 

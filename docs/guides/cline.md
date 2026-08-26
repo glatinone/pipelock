@@ -45,7 +45,8 @@ pipelock cline install
 For outbound HTTP that Cline executes through tool calls (`curl`, `wget`, etc.), run pipelock as a forward proxy and point the agent shell at it:
 
 ```bash
-pipelock run --config configs/balanced.yaml &
+pipelock generate config --preset balanced > pipelock.yaml
+pipelock run --config pipelock.yaml &
 export HTTPS_PROXY=http://127.0.0.1:8888
 export HTTP_PROXY=http://127.0.0.1:8888
 export NO_PROXY=127.0.0.1,localhost
@@ -57,12 +58,12 @@ Combined with MCP wrapping, this covers Cline MCP traffic and HTTP clients that 
 
 | Preset | Action | Best for |
 |---|---|---|
-| `balanced.yaml` | warn | Getting started, tuning phase |
-| `claude-code.yaml` | block | Unattended Cline sessions on regulated codebases |
-| `strict.yaml` | block | High-security repos, third-party plugin work |
-| `hostile-model.yaml` | block | If running an uncensored or jailbroken model under Cline |
+| `balanced` | warn | Getting started, tuning phase |
+| `claude-code` | block | Unattended Cline sessions on regulated codebases |
+| `strict` | block | High-security repos, third-party plugin work |
+| `hostile-model` | block | If running an uncensored or jailbroken model under Cline |
 
-Start with `balanced.yaml` to see what gets flagged. Switch to `claude-code.yaml` or `strict.yaml` once you've verified no false positives in your workflow.
+Start with `balanced` to see what gets flagged. Switch to `claude-code` or `strict` once you've verified no false positives in your workflow.
 
 ## Action Receipts
 

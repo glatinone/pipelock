@@ -10,9 +10,17 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+README = ROOT / "README.md"
 WORKFLOW = ROOT / ".github" / "workflows" / "continuous-gauntlet.yaml"
 RELEASE_PIN = ROOT / "benchmark" / "gauntlet-release.env"
-EXPECTED_AEB_REF = "53c95da15268447709914834a716516fd682bf1d"
+EXPECTED_AEB_REF = "2d6cb1d6e1a6d8a11b8e5a1649e7dee1c6e56aea"
+GAUNTLET_WORKFLOW_URL = (
+    "https://github.com/luckyPipewrench/pipelock/actions/workflows/continuous-gauntlet.yaml"
+)
+GAUNTLET_BADGE_URL = GAUNTLET_WORKFLOW_URL + "/badge.svg"
+PLAYGROUND_PAGE_URL = "https://pipelab.org/playground"
+PLAYGROUND_BROKER_ORIGIN = "https://playground.pipelab.org"
+PUBLIC_RESULTS_URL = "https://pipelab.org/gauntlet/results/"
 EVIDENCE_FILES = (
     "continuous-gauntlet-pipelock.json",
     "promotion-decision.json",
@@ -84,13 +92,13 @@ class GauntletCandidateWorkflowTest(unittest.TestCase):
             assignments,
             {
                 "PIPELOCK_REPO": "luckyPipewrench/pipelock",
-                "PIPELOCK_TAG": "v3.3.0",
-                "PIPELOCK_VERSION": "3.3.0",
+                "PIPELOCK_TAG": "v3.4.0",
+                "PIPELOCK_VERSION": "3.4.0",
                 "PIPELOCK_ASSET_SHA256_AMD64": (
-                    "cbc03ba3a5cc1400e288f4a2782ffd59ca162f5f0120d972ab82717ad5519dfc"
+                    "37c267a9c7a5472324e3bb07def179e810a5ae7c8e761537ad1e9b2e32e9abac"
                 ),
                 "PIPELOCK_ASSET_SHA256_ARM64": (
-                    "d682ffb0f81138099a14f8c991880688ea692f80cd114d75010eb9a622e1fbf6"
+                    "9f956e9bee7c7a8dc7530addd9017fb96cf88ba68075b55ad54c870ad99ab9ac"
                 ),
             },
         )
@@ -128,6 +136,45 @@ class GauntletCandidateWorkflowTest(unittest.TestCase):
         self.assertIn("schedule:", trigger)
         self.assertNotIn("pull_request", trigger)
         self.assertNotRegex(trigger, r"(?m)^\s+push:")
+
+    def test_readme_exposes_gauntlet_candidate_badge(self):
+        readme = README.read_text(encoding="utf-8")
+        self.assertTrue(
+            GAUNTLET_BADGE_URL in readme,
+            "README missing Gauntlet candidate badge URL",
+        )
+        self.assertTrue(
+            f'href="{GAUNTLET_WORKFLOW_URL}"' in readme,
+            "README missing Gauntlet candidate workflow link",
+        )
+        self.assertTrue('alt="Gauntlet exam"' in readme, "README missing Gauntlet exam badge alt text")
+        self.assertNotIn(
+            'alt="Agent Egress Bench"',
+            readme,
+            "the scheduled-exam badge must not use the corpus repo name",
+        )
+        self.assertTrue(
+            "does not auto-publish a public score" in readme,
+            "README missing candidate-exam non-publish sentence",
+        )
+        self.assertTrue(
+            PLAYGROUND_PAGE_URL in readme,
+            "README missing the public playground page",
+        )
+        self.assertNotIn(
+            PLAYGROUND_BROKER_ORIGIN,
+            readme,
+            "README must not send people to the playground broker origin",
+        )
+        self.assertTrue(
+            PUBLIC_RESULTS_URL in readme,
+            "README missing the public Gauntlet results page",
+        )
+        self.assertIsNone(
+            re.search(r"https://pipelab\.org/gauntlet/(?!results/)", readme),
+            "README still has a Gauntlet link that is not /gauntlet/results/",
+        )
+        self.assertNotRegex(readme, r"(?i)\bnightly\b")
 
     def test_checkout_credentials_and_actions_are_pinned(self):
         checkout_count = self.workflow.count("uses: actions/checkout@")

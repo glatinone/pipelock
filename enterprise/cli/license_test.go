@@ -68,12 +68,14 @@ func TestLicenseStatusValidWithWarningBand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	now := time.Now().UTC()
 	lic := license.License{
 		ID:        "lic_status",
 		Email:     "status@example.com",
-		IssuedAt:  time.Now().Unix(),
-		ExpiresAt: time.Now().Add(7 * 24 * time.Hour).Unix(),
-		Features:  []string{license.FeatureAgents},
+		Org:       "Status Org",
+		IssuedAt:  now.Add(-49 * 24 * time.Hour).Unix(),
+		ExpiresAt: now.Add(7 * 24 * time.Hour).Unix(),
+		Features:  []string{license.FeatureAgents, license.FeatureFleet},
 		Tier:      "pro",
 	}
 	token, err := license.Issue(lic, priv)
@@ -94,6 +96,57 @@ func TestLicenseStatusValidWithWarningBand(t *testing.T) {
 	}
 	if report.Severity != license.ExpirySeverityWarn {
 		t.Errorf("Severity = %q, want warn", report.Severity)
+	}
+	if report.Warning != "license expires in 7 day(s) on "+time.Unix(lic.ExpiresAt, 0).UTC().Format(time.DateOnly)+"; check billing or token delivery" {
+		t.Errorf("Warning = %q, want subscription billing guidance", report.Warning)
+	}
+	// Entitlements belong on the VERIFIED surface. Without these, status answered
+	// "are you licensed" but not "for what", and the only way to read features was
+	// license inspect, which states plainly that it does not check the signature.
+	if report.Org != "Status Org" {
+		t.Errorf("Org = %q, want %q", report.Org, "Status Org")
+	}
+	if len(report.Features) != 2 || report.Features[0] != license.FeatureAgents || report.Features[1] != license.FeatureFleet {
+		t.Errorf("Features = %v, want [%s %s]", report.Features, license.FeatureAgents, license.FeatureFleet)
+	}
+}
+
+func TestLicenseStatusTrialWarningMessage(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	lic := license.License{
+		ID:        "lic_trial_status",
+		Email:     "trial-status@example.com",
+		IssuedAt:  now.Add(-16 * 24 * time.Hour).Unix(),
+		ExpiresAt: now.Add(14 * 24 * time.Hour).Unix(),
+		Features:  []string{license.FeatureAgents},
+		Tier:      "trial",
+	}
+	token, err := license.Issue(lic, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := buildLicenseStatusReport(writeLicenseStatusConfig(t, token, pub, ""), "")
+	if err != nil {
+		t.Fatalf("buildLicenseStatusReport: %v", err)
+	}
+	if report.WarningBand != 15 || report.Severity != license.ExpirySeverityInfo {
+		t.Fatalf("report = %+v, want 15-day info warning", report)
+	}
+	want := "trial ends in 14 day(s) on " + time.Unix(lic.ExpiresAt, 0).UTC().Format(time.DateOnly) + "; Pro features stop at expiry. Subscribe at https://pipelab.org/pricing/"
+	if report.Warning != want {
+		t.Fatalf("Warning = %q, want %q", report.Warning, want)
+	}
+
+	cmd := licenseStatusCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	printLicenseStatus(cmd, report)
+	if !strings.Contains(out.String(), want) {
+		t.Fatalf("printed status missing trial warning: %q", out.String())
 	}
 }
 
@@ -276,9 +329,10 @@ func TestLicenseStatusCommandOutputs(t *testing.T) {
 	lic := license.License{
 		ID:             "lic_status_cmd",
 		Email:          "status@example.com",
+		Org:            "Status Cmd Org",
 		IssuedAt:       now.Unix(),
 		ExpiresAt:      now.Add(45 * 24 * time.Hour).Unix(),
-		Features:       []string{license.FeatureAgents},
+		Features:       []string{license.FeatureAgents, license.FeatureFleet},
 		Tier:           "enterprise",
 		SubscriptionID: "sub_status",
 	}
@@ -297,10 +351,85 @@ func TestLicenseStatusCommandOutputs(t *testing.T) {
 		if err := cmd.Execute(); err != nil {
 			t.Fatalf("status: %v", err)
 		}
-		for _, want := range []string{"License status: valid", "lic_status_cmd", "enterprise", "sub_status"} {
+		// Entitlements are asserted on the rendered output, not only on the
+		// report struct: the point of the change is that an operator running
+		// `license status` can read what the license actually grants, and a
+		// populated struct with an unprinted field would satisfy a struct-only
+		// test while telling the operator nothing.
+		for _, want := range []string{
+			"License status: valid", "lic_status_cmd", "enterprise", "sub_status",
+			"Org:", "Status Cmd Org",
+			"Features:", license.FeatureAgents, license.FeatureFleet,
+		} {
 			if !strings.Contains(buf.String(), want) {
 				t.Fatalf("output missing %q:\n%s", want, buf.String())
 			}
+		}
+	})
+
+	t.Run("json valid", func(t *testing.T) {
+		cmd := licenseStatusCmd()
+		cmd.SilenceUsage = true
+		var buf bytes.Buffer
+		cmd.SetOut(&buf)
+		cmd.SetArgs([]string{"--config", cfgPath, "--json"})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("status --json: %v", err)
+		}
+		var report licenseStatusReport
+		if jsonErr := json.Unmarshal(buf.Bytes(), &report); jsonErr != nil {
+			t.Fatalf("invalid JSON: %v\n%s", jsonErr, buf.String())
+		}
+		if report.Status != licenseStatusValid {
+			t.Fatalf("status = %q, want valid", report.Status)
+		}
+		if report.Org != "Status Cmd Org" {
+			t.Errorf("json org = %q, want %q", report.Org, "Status Cmd Org")
+		}
+		want := []string{license.FeatureAgents, license.FeatureFleet}
+		if len(report.Features) != len(want) {
+			t.Fatalf("json features = %v, want %v", report.Features, want)
+		}
+		for i, f := range want {
+			if report.Features[i] != f {
+				t.Errorf("json features[%d] = %q, want %q", i, report.Features[i], f)
+			}
+		}
+	})
+
+	t.Run("invalid signature carries no entitlements", func(t *testing.T) {
+		// A token signed by a key the config does not trust must not leak the
+		// org or features it CLAIMS. Verification returns a zero license on a
+		// signature failure, so status reports entitlements only for a license
+		// whose signature actually verified.
+		otherPub, _, keyErr := ed25519.GenerateKey(rand.Reader)
+		if keyErr != nil {
+			t.Fatal(keyErr)
+		}
+		badCfg := writeLicenseStatusConfig(t, token, otherPub, "")
+		cmd := licenseStatusCmd()
+		cmd.SilenceUsage = true
+		var buf bytes.Buffer
+		cmd.SetOut(&buf)
+		cmd.SetArgs([]string{"--config", badCfg, "--json"})
+		if err := cmd.Execute(); err == nil {
+			t.Fatal("expected an invalid-signature error")
+		}
+		var report licenseStatusReport
+		if jsonErr := json.Unmarshal(buf.Bytes(), &report); jsonErr != nil {
+			t.Fatalf("invalid JSON: %v\n%s", jsonErr, buf.String())
+		}
+		if report.Status == licenseStatusValid {
+			t.Fatalf("status = valid for an untrusted signer; report=%+v", report)
+		}
+		if report.Org != "" {
+			t.Errorf("org = %q for an unverified license, want empty", report.Org)
+		}
+		if len(report.Features) != 0 {
+			t.Errorf("features = %v for an unverified license, want none", report.Features)
+		}
+		if strings.Contains(buf.String(), "Status Cmd Org") {
+			t.Errorf("unverified license leaked its claimed org:\n%s", buf.String())
 		}
 	})
 
@@ -419,6 +548,7 @@ func TestPrintLicenseStatusVariants(t *testing.T) {
 		DaysRemaining:  7,
 		WarningBand:    7,
 		Severity:       "warn",
+		Warning:        "license expires in 7 day(s) on 2026-06-01; check billing or token delivery",
 		Intermediate:   true,
 		CRLConfigured:  true,
 		CRLExpiresAt:   "2026-06-02",

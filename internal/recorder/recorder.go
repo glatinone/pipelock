@@ -29,6 +29,8 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 )
 
+var recorderCreateWritabilityProbe = os.CreateTemp
+
 // Default values for recorder configuration.
 const (
 	defaultCheckpointInterval = 1000
@@ -51,11 +53,11 @@ const (
 	// retry loop. O_EXCL still prevents every overwrite on every attempt.
 	maxEscrowNameAttempts = 16
 
-	// recorderTypeReceipt is the entry type for action receipts. These get
-	// selective field redaction (target/pattern only) instead of full detail
-	// replacement, preserving receipt structure for audit while preventing
-	// plaintext secrets in evidence files.
-	recorderTypeReceipt = "action_receipt"
+	// Signed receipt details must never be mutated after signing. If recorder
+	// DLP finds a secret in either receipt format, recording fails closed before
+	// any bytes are written.
+	recorderTypeReceipt         = "action_receipt"
+	recorderTypeEvidenceReceipt = "evidence_receipt"
 
 	// eventKindCheckpoint is the EventKind value stamped on checkpoint
 	// entries written by the recorder. Fixed value - checkpoints are an
@@ -70,17 +72,17 @@ const (
 
 // Config configures the flight recorder.
 type Config struct {
-	Enabled            bool        `yaml:"enabled"`
-	Dir                string      `yaml:"dir"`
-	CheckpointInterval int         `yaml:"checkpoint_interval"`
-	RetentionDays      int         `yaml:"retention_days"`
-	Redact             bool        `yaml:"redact"`
-	SignCheckpoints    bool        `yaml:"sign_checkpoints"`
-	MaxEntriesPerFile  int         `yaml:"max_entries_per_file"`
-	FileMode           os.FileMode `yaml:"file_mode"`
-	RawEscrow          bool        `yaml:"raw_escrow"`
-	EscrowPublicKey    string      `yaml:"escrow_public_key"`
-	Metrics            MetricsSink `yaml:"-"`
+	Enabled            bool
+	Dir                string
+	CheckpointInterval int
+	RetentionDays      int
+	Redact             bool
+	SignCheckpoints    bool
+	MaxEntriesPerFile  int
+	FileMode           os.FileMode
+	RawEscrow          bool
+	EscrowPublicKey    string
+	Metrics            MetricsSink
 }
 
 func safeEvidenceFileMode(mode os.FileMode) bool {
@@ -228,6 +230,17 @@ func New(cfg Config, redactFn RedactFunc, privKey ed25519.PrivateKey) (*Recorder
 	if err := os.MkdirAll(filepath.Clean(cfg.Dir), dirPermissions); err != nil {
 		return nil, fmt.Errorf("creating evidence directory: %w", err)
 	}
+	ceremonyLock, ceremonyDir, err := acquireEvidenceWriterCeremonyLock(cfg.Dir)
+	if err != nil {
+		return nil, err
+	}
+	lockTransferred := false
+	defer func() {
+		if !lockTransferred && ceremonyLock != nil {
+			_ = unlockEvidenceFile(ceremonyLock)
+			_ = ceremonyLock.Close()
+		}
+	}()
 
 	// Writability probe: fail closed at startup if the evidence directory
 	// exists but is not writable. Without this, pipelock boots successfully
@@ -235,7 +248,7 @@ func New(cfg Config, redactFn RedactFunc, privKey ed25519.PrivateKey) (*Recorder
 	// wrong filesystem perms) and silently drops every receipt's persistence
 	// while still enforcing policy - round-3 of the pre-tag gate finding. Operators end up
 	// running in a degraded, non-auditable state without a clear signal.
-	probe, probeErr := os.CreateTemp(filepath.Clean(cfg.Dir), ".pipelock-writability-probe-*")
+	probe, probeErr := recorderCreateWritabilityProbe(filepath.Clean(cfg.Dir), ".pipelock-writability-probe-*")
 	if probeErr != nil {
 		return nil, fmt.Errorf("evidence directory %s is not writable (receipts would not persist): %w", cfg.Dir, probeErr)
 	}
@@ -268,12 +281,9 @@ func New(cfg Config, redactFn RedactFunc, privKey ed25519.PrivateKey) (*Recorder
 		r.escrowPub = &pub
 	}
 
-	ceremonyLock, ceremonyDir, err := acquireEvidenceWriterCeremonyLock(cfg.Dir)
-	if err != nil {
-		return nil, err
-	}
 	r.ceremonyLock = ceremonyLock
 	r.ceremonyDir = ceremonyDir
+	lockTransferred = true
 	r.evidenceDir = ceremonyDir
 	if r.evidenceDir == nil {
 		r.evidenceDir, err = os.Stat(filepath.Clean(cfg.Dir))
@@ -492,6 +502,10 @@ func (r *Recorder) prepareAndWriteEntryLocked(e Entry, notify bool) (Entry, erro
 	}
 
 	e.Version = CurrentWriteEntryVersion
+	// RawDetail is parser provenance for an entry read from disk. A caller must
+	// never be able to smuggle stale or unredacted provenance bytes into a new
+	// write: escrow, redaction, and hashing below all derive from Detail.
+	e.RawDetail = nil
 	// Namespace fields are authenticated only by the v3 projection. Strip any
 	// caller-supplied values while this binary emits v2 so unhashed metadata
 	// cannot leak into the evidence file or an enterprise audit envelope.
@@ -500,6 +514,11 @@ func (r *Recorder) prepareAndWriteEntryLocked(e Entry, notify bool) (Entry, erro
 	e.Sequence = r.seq
 	e.Timestamp = time.Now().UTC()
 	e.PrevHash = r.prevHash
+	if e.Type == recorderTypeReceipt || e.Type == recorderTypeEvidenceReceipt {
+		if err := r.ValidateSignedReceiptDetail(e.Detail); err != nil {
+			return Entry{}, err
+		}
+	}
 
 	// Raw escrow: encrypt detail before redaction. Escrow must succeed
 	// when enabled -- silent drops would lose raw evidence.
@@ -522,9 +541,7 @@ func (r *Recorder) prepareAndWriteEntryLocked(e Entry, notify bool) (Entry, erro
 	// Raw escrow preserves the exact detail passed to the recorder for
 	// forensic replay.
 	if r.cfg.Redact && r.redactFn != nil {
-		if e.Type == recorderTypeReceipt {
-			e.Detail = r.redactReceiptDetail(e.Detail)
-		} else {
+		if e.Type != recorderTypeReceipt && e.Type != recorderTypeEvidenceReceipt {
 			e.Detail = r.redactDetail(e.Detail)
 		}
 	}
@@ -535,6 +552,16 @@ func (r *Recorder) prepareAndWriteEntryLocked(e Entry, notify bool) (Entry, erro
 		return Entry{}, fmt.Errorf("writing entry: %w", err)
 	}
 	return e, nil
+}
+
+// ValidateSignedReceiptDetail checks whether a signed receipt can be persisted
+// without post-signature redaction. Emitters call this before advancing their
+// chain state; Record repeats it at the write boundary.
+func (r *Recorder) ValidateSignedReceiptDetail(detail any) error {
+	if r == nil || !r.cfg.Redact || r.redactFn == nil {
+		return nil
+	}
+	return r.validateReceiptDetailClean(detail)
 }
 
 // runPostRecordMaintenanceLocked applies checkpoint and rotation thresholds
@@ -759,82 +786,22 @@ func (r *Recorder) redactDetail(detail any) any {
 	}
 }
 
-// redactReceiptDetail selectively redacts sensitive fields (target, pattern)
-// in a receipt entry while preserving the receipt structure. Current receipt
-// emitters sanitize those fields before signing, so this should return the
-// detail unchanged for normal receipts. If a malformed, legacy, or unexpected
-// receipt still contains a DLP hit, fail closed rather than writing a secret
-// to the evidence file; that fallback may make that receipt unverifiable.
-func (r *Recorder) redactReceiptDetail(detail any) any {
+// validateReceiptDetailClean prevents post-signature mutation. Receipt emitters
+// sanitize fields before signing; a hit here means the signed object is unsafe
+// to persist and cannot be redacted without invalidating its proof.
+func (r *Recorder) validateReceiptDetailClean(detail any) error {
 	if detail == nil {
 		return nil
 	}
 
 	raw, err := json.Marshal(detail)
 	if err != nil {
-		// Fail-closed: can't inspect, don't pass through unredacted.
-		return map[string]any{
-			"redacted": true,
-			"reason":   "marshal error",
-		}
+		return fmt.Errorf("scan signed receipt detail before recording: marshal detail: %w", err)
 	}
-
-	// Quick check: does the whole detail contain any DLP matches?
-	result := r.redactFn(context.Background(), string(raw))
-	if result.Clean {
-		return detail // No secrets found, no redaction needed
+	if result := r.redactFn(context.Background(), string(raw)); !result.Clean {
+		return errors.New("signed receipt detail contains sensitive data; refusing to record unverifiable redaction")
 	}
-
-	// Parse as map to access nested fields
-	var m map[string]any
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return r.redactDetail(detail) // fallback to full redaction
-	}
-
-	ar, ok := m["action_record"].(map[string]any)
-	if !ok {
-		return r.redactDetail(detail) // not a receipt structure, fallback
-	}
-
-	// Redact sensitive fields that may contain secrets.
-	var redactedFields []string
-	for _, field := range []string{"target", "pattern"} {
-		if val, exists := ar[field]; exists {
-			valStr, isStr := val.(string)
-			if !isStr || valStr == "" {
-				continue
-			}
-			fieldResult := r.redactFn(context.Background(), valStr)
-			if !fieldResult.Clean {
-				ar[field] = "[REDACTED]"
-				redactedFields = append(redactedFields, field)
-			}
-		}
-	}
-
-	// Fail-closed: if the quick-check found DLP matches but none were in
-	// target/pattern, a secret is hiding in an unexpected field. Fall back
-	// to full redaction rather than letting it through.
-	if len(redactedFields) == 0 {
-		return r.redactDetail(detail)
-	}
-
-	ar["redacted_fields"] = redactedFields
-	m["action_record"] = ar
-
-	// Re-scan after selective redaction: if a secret was in both target
-	// AND an unexpected field (e.g., agent), the per-field loop caught
-	// target but the other field survives. Fall back to full redaction
-	// if the partially redacted receipt still has DLP matches.
-	partialJSON, err := json.Marshal(m)
-	if err != nil {
-		return r.redactDetail(detail)
-	}
-	if rescan := r.redactFn(context.Background(), string(partialJSON)); !rescan.Clean {
-		return r.redactDetail(detail)
-	}
-
-	return m
+	return nil
 }
 
 // writeEscrow encrypts raw detail JSON with X25519 NaCl box and writes to sidecar.
@@ -953,18 +920,12 @@ func (r *Recorder) resumeSessionLocked(sessionID string) error {
 		// older sequence and fork the chain.
 		last := entries[0]
 
-		// NOTE: We do NOT recompute and verify the tail hash here because
-		// ComputeHash is not round-trip stable for entries whose Detail was
-		// stored as json.RawMessage (e.g., receipt entries). ReadEntries
-		// deserializes Detail into map[string]interface{}, which re-marshals
-		// with alphabetically sorted keys, producing a different hash than
-		// the original struct-ordered JSON. Full chain verification (which
-		// has the same limitation) is done by verify-receipt / VerifyChain.
-		// The chain linkage (prevHash threading) is still enforced on each
-		// new Record call.
 		if last.Hash == "" {
 			return fmt.Errorf("evidence file %s: tail entry seq %d has empty hash",
 				candidate.base, last.Sequence)
+		}
+		if computed := ComputeHash(last); computed != last.Hash {
+			return fmt.Errorf("evidence file %s: tail entry seq %d hash mismatch: computed %s, stored %s", candidate.base, last.Sequence, computed, last.Hash)
 		}
 
 		// Filtering candidates by parsed filename settles which shard to read,

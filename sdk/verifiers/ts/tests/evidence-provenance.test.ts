@@ -8,7 +8,8 @@ import test from "node:test";
 import {
   applyEvidenceProvenanceRecipe,
   EVIDENCE_PROVENANCE_PROFILE_V1_DIGEST,
-  supportedOperationKinds,
+  EVIDENCE_PROVENANCE_PROFILE_V2_DIGEST,
+  supportedOperationKindsForProfile,
 } from "../src/provenance.js";
 import { findPackageRoot } from "./paths.js";
 
@@ -25,6 +26,10 @@ const corpusPath = resolve(
   packageRoot,
   "../../conformance/testdata/transform-profile/evidence-provenance-v1.json",
 );
+const corpusPathV2 = resolve(
+  packageRoot,
+  "../../conformance/testdata/transform-profile/evidence-provenance-v2.json",
+);
 const corpus = JSON.parse(readFileSync(corpusPath, "utf8")) as {
   profile_digest: string;
   operation_coverage: string[];
@@ -39,12 +44,15 @@ test("evidence provenance: pinned corpus profile and every operation are exercis
       .flatMap((v) => (v.recipe ?? []).map((op) => (op as { kind: string }).kind)),
   );
   assert.deepEqual([...seen].sort(), [...corpus.operation_coverage].sort());
-  assert.deepEqual([...supportedOperationKinds()].sort(), [...corpus.operation_coverage].sort());
+  assert.deepEqual(
+    [...supportedOperationKindsForProfile(EVIDENCE_PROVENANCE_PROFILE_V1_DIGEST)].sort(),
+    [...corpus.operation_coverage].sort(),
+  );
 });
 
 for (const vector of corpus.vectors)
   test(`evidence provenance: ${vector.id}`, () => {
-    const recipe = {
+    const recipe: { transform_profile_digest: string; operations: unknown[] } = {
       transform_profile_digest: vector.transform_profile_digest ?? corpus.profile_digest,
       operations: vector.recipe ?? [],
     };
@@ -63,6 +71,46 @@ for (const vector of corpus.vectors)
       vector.output_b64,
     );
   });
+
+test("evidence provenance: v2 corpus executes every vector byte-exactly", () => {
+  const v2 = JSON.parse(readFileSync(corpusPathV2, "utf8")) as {
+    profile_digest: string;
+    vectors: Vector[];
+  };
+  assert.equal(v2.profile_digest, EVIDENCE_PROVENANCE_PROFILE_V2_DIGEST);
+  for (const vector of v2.vectors) {
+    const recipe: { transform_profile_digest: string; operations: unknown[] } = {
+      transform_profile_digest: vector.transform_profile_digest ?? v2.profile_digest,
+      operations: vector.recipe ?? [],
+    };
+    if (vector.want_error) {
+      assert.throws(
+        () => applyEvidenceProvenanceRecipe(Buffer.from(vector.input_b64, "base64"), recipe),
+        (error: unknown) => error instanceof Error && error.message.includes(vector.want_error!),
+        vector.id,
+      );
+      continue;
+    }
+    assert.equal(
+      Buffer.from(
+        applyEvidenceProvenanceRecipe(Buffer.from(vector.input_b64, "base64"), recipe),
+      ).toString("base64"),
+      vector.output_b64,
+      vector.id,
+    );
+  }
+});
+
+test("evidence provenance: v1 rejects the v2-only alphanumeric operation", () => {
+  assert.throws(
+    () =>
+      applyEvidenceProvenanceRecipe(Buffer.from("AKIA" + "----ABCDEFGHIJKLMNOP"), {
+        transform_profile_digest: EVIDENCE_PROVENANCE_PROFILE_V1_DIGEST,
+        operations: [{ kind: "ascii_alphanumeric_strip" }],
+      }),
+    /unsupported by transform profile/u,
+  );
+});
 
 test("evidence provenance: HTML5 named entities decode repeatedly", () => {
   const recipe = {
@@ -112,13 +160,15 @@ test("evidence provenance: execution limits reject unbounded verifier work", () 
   );
 });
 
-test("encoded token normalization rejects non-ASCII whitespace separators", () => {
+// Profile v2 mirrors the scanner's current per-alphabet keep-set. Profile v1
+// remains the historical allow-list, so this change is selected by digest.
+test("v2 encoded token normalization strips non-ASCII whitespace separators", () => {
   for (const separator of ["\u00a0", "\u1680", "\u3000", "\ufeff"]) {
     const output = applyEvidenceProvenanceRecipe(Buffer.from(`SG${separator}k=`), {
-      transform_profile_digest: EVIDENCE_PROVENANCE_PROFILE_V1_DIGEST,
+      transform_profile_digest: EVIDENCE_PROVENANCE_PROFILE_V2_DIGEST,
       operations: [{ kind: "encoded_token_normalize", alphabet: "base64_standard" }],
     });
-    assert.equal(Buffer.from(output).toString(), "");
+    assert.equal(Buffer.from(output).toString(), "SGk=");
   }
 });
 

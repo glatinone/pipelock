@@ -131,6 +131,15 @@ func RunHTTPProxy(
 	if opts.ContractServer == "" {
 		opts.ContractServer = mcpContractServerFromUpstream(upstreamURL)
 	}
+	if opts.AuthorityDestination == "" {
+		opts.AuthorityDestination = upstreamURL
+	}
+	if opts.A2ACardURL == "" {
+		opts.A2ACardURL = upstreamURL
+	}
+	if opts.A2ACardAuthFingerprint == "" {
+		opts.A2ACardAuthFingerprint = CardCacheKeyFromRequest("", extraHeaders.Get("Authorization")).authFingerprint
+	}
 	opts.TaintExternalSource = true
 
 	if gate, gateErr := evaluateMCPUpstreamGate(ctx, upstreamURL, opts); gateErr != nil {
@@ -288,6 +297,15 @@ func RunHTTPProxy(
 					SessionIDOriginal: deferredReq.SessionIDOriginal,
 				},
 				Resolve: func(res deferred.Resolution) {
+					authorityDenied := false
+					if res.FinalDecision == config.ActionAllow {
+						if authErr := authorizeMCP(ctx, deferredReq.authorityRef, deferredReq.authorityCarrierErr, deferredReq.authorityFrame, fwdOpts); authErr != nil {
+							res.FinalDecision = config.ActionBlock
+							res.ResolutionSource = deferred.SourceAuthority
+							res.Reason = "authority verification failed"
+							authorityDenied = true
+						}
+					}
 					if emitErr := emitDeferredResolutionReceipt(fwdOpts, safeLogW, res); emitErr != nil {
 						if !deferredReq.IsNotification {
 							_ = safeClientOut.WriteMessage(blockRequestResponse(BlockedRequest{
@@ -303,7 +321,7 @@ func RunHTTPProxy(
 						upstreamMu.Lock()
 						defer upstreamMu.Unlock()
 						if isRequest(deferredReq.ForwardMessage) {
-							tracker.Track(deferredReq.ID)
+							tracker.TrackRequest(deferredReq.ID, deferredReq.Method)
 						}
 						respReader, sendErr := httpClient.SendMessage(ctx, deferredReq.ForwardMessage)
 						if sendErr != nil {
@@ -335,6 +353,10 @@ func RunHTTPProxy(
 						}
 					default:
 						if !deferredReq.IsNotification {
+							if authorityDenied {
+								_ = safeClientOut.WriteMessage(blockRequestResponse(*authorityBlockedRequest(deferredReq.authorityFrame)))
+								return
+							}
 							_ = safeClientOut.WriteMessage(blockRequestResponse(BlockedRequest{
 								ID:           deferredReq.ID,
 								ErrorCode:    -32002,
@@ -375,9 +397,11 @@ func RunHTTPProxy(
 		// server-initiated calls, to prevent tracker pollution.
 		if isRequest(msg) {
 			if decision.Outcome.Receipt.ActionID != "" {
-				tracker.TrackOutcome(frame.ID, decision.Outcome)
+				outcome := decision.Outcome
+				outcome.Method = frame.Method
+				tracker.TrackOutcome(frame.ID, outcome)
 			} else {
-				tracker.Track(frame.ID)
+				tracker.TrackRequest(frame.ID, frame.Method)
 			}
 		}
 

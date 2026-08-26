@@ -144,6 +144,7 @@ Coverage note: terminal proxy passthrough is cooperative. pipelock sees
 sandbox traffic only when the proxy env VALUES are also set in Hermes'
 environment and the backend honors them. This is not binary-enforced
 network isolation.`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runInstall(cmd, opts)
 		},
@@ -224,7 +225,7 @@ func installMCPOnly(cmd *cobra.Command, opts *installOptions) error {
 			failed++
 			continue
 		}
-		if mcpwrap.IsWrapped(server) {
+		if mcpwrap.IsWrappedBySelf(server) {
 			skipped++
 			continue
 		}

@@ -17,6 +17,12 @@ REPO_ROOT="$(cd "$EXAMPLE_DIR/../.." && pwd)"
 PIPELOCK="${PIPELOCK_BIN:-$REPO_ROOT/pipelock}"
 CONFIG="$EXAMPLE_DIR/pipelock.yaml"
 SERVER="$EXAMPLE_DIR/policy_decoy_server.py"
+WORK="$(mktemp -d)"
+# Interim cleanup so a failure during setup cannot leave the workspace behind.
+# The full trap below replaces this one once the other resources exist.
+trap 'rm -rf "$WORK" 2>/dev/null || true' EXIT
+. "$REPO_ROOT/scripts/e2e/hermetic-env.sh"
+pipelock_hermetic_env "$WORK/hermetic"
 
 PASS=0
 FAIL=0
@@ -42,7 +48,7 @@ cleanup_proxy() {
   PROXY_PID=""
 }
 
-trap 'cleanup_proxy; rm -f "${RESP_FILE:-}" "${PROXY_ERR:-}" 2>/dev/null || true; rm -rf "${PROXY_TMPDIR:-}" 2>/dev/null || true' EXIT
+trap 'cleanup_proxy; rm -f "${RESP_FILE:-}" "${PROXY_ERR:-}" 2>/dev/null || true; rm -rf "${PROXY_TMPDIR:-}" "$WORK" 2>/dev/null || true' EXIT
 
 start_proxy() {
   cleanup_proxy

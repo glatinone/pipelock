@@ -131,7 +131,7 @@ func principalStateOpts(t *testing.T, bearer string) MCPProxyOpts {
 }
 
 // TestHTTPListener_PrincipalState_CurrentSpecSharedBearerRejectsSpoofedPartitions
-// is the core AF-326 customer path. A successfully verified listener bearer is
+// is the core customer path. A successfully verified listener bearer is
 // one intentionally shared principal. Current-spec requests do not initialize
 // an MCP session and never replay Pipelock's private extension token, so they
 // must still retain state across a read -> exec chain. Client-supplied headers
@@ -672,6 +672,25 @@ func TestMCPListenerPrincipalState_DoWTrustMatchesIdentityStrength(t *testing.T)
 	}
 	if verified.key == verifiedNextEpoch.key || verified.billingKey != verifiedNextEpoch.billingKey {
 		t.Fatal("verifier epoch must reset security state without resetting its DoW budget")
+	}
+}
+
+func TestMCPListenerAuthorityActorIsUnambiguous(t *testing.T) {
+	t.Parallel()
+	states := newMCPListenerClientStates(nil)
+	left, err := states.principal("a:b", "c", 0)
+	if err != nil {
+		t.Fatalf("left principal: %v", err)
+	}
+	right, err := states.principal("a", "b:c", 0)
+	if err != nil {
+		t.Fatalf("right principal: %v", err)
+	}
+	if left.actor == right.actor {
+		t.Fatalf("distinct principals collapsed to authority actor %q", left.actor)
+	}
+	if left.actor != "principal-v1:3:a:b1:c" || right.actor != "principal-v1:1:a3:b:c" {
+		t.Fatalf("authority actors = (%q, %q), want canonical length-delimited encoding", left.actor, right.actor)
 	}
 }
 

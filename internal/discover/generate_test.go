@@ -4,6 +4,7 @@
 package discover
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -18,7 +19,7 @@ func TestGenerateWrapperStdio(t *testing.T) {
 		Protection: Unprotected,
 	}
 
-	suggestion := GenerateWrapper(server)
+	suggestion := generateWrapper(server, "/opt/pipelock")
 	if suggestion == "" {
 		t.Fatal("expected non-empty suggestion")
 	}
@@ -45,7 +46,7 @@ func TestGenerateWrapperHTTP(t *testing.T) {
 		Protection: Unprotected,
 	}
 
-	suggestion := GenerateWrapper(server)
+	suggestion := generateWrapper(server, "/opt/pipelock")
 	if !strings.Contains(suggestion, "--upstream") {
 		t.Error("HTTP suggestion should contain --upstream")
 	}
@@ -61,7 +62,7 @@ func TestGenerateWrapperUnknown(t *testing.T) {
 		Protection: Unprotected,
 	}
 
-	suggestion := GenerateWrapper(server)
+	suggestion := generateWrapper(server, "/opt/pipelock")
 	if !strings.Contains(suggestion, "no suggestion") {
 		t.Error("should indicate no suggestion available")
 	}
@@ -78,7 +79,7 @@ func TestGenerateWrapperStdioWithEnv(t *testing.T) {
 		Protection: Unprotected,
 	}
 
-	suggestion := GenerateWrapper(server)
+	suggestion := generateWrapper(server, "/opt/pipelock")
 	if !strings.Contains(suggestion, `"--env"`) {
 		t.Error("suggestion should contain --env flags for env vars")
 	}
@@ -106,11 +107,21 @@ func TestGenerateWrapperNoArgs(t *testing.T) {
 		Protection: Unprotected,
 	}
 
-	suggestion := GenerateWrapper(server)
+	suggestion := generateWrapper(server, "/opt/pipelock")
 	if !strings.Contains(suggestion, wrapperCommand) {
 		t.Error("suggestion should contain pipelock")
 	}
 	if !strings.Contains(suggestion, "myserver") {
 		t.Error("suggestion should contain original command")
+	}
+}
+
+func TestGenerateWrapperUnavailableExecutable(t *testing.T) {
+	if got := generateWrapper(MCPServer{Transport: TransportStdio, Command: "server"}, ""); !strings.Contains(got, "path is unavailable") {
+		t.Fatalf("generateWrapper unavailable executable = %q", got)
+	}
+	resolver := func() (string, error) { return "/untrusted/partial/path", errors.New("unsupported") }
+	if got := generateWrapperForCurrent(MCPServer{Transport: TransportStdio, Command: "server"}, resolver); !strings.Contains(got, "path is unavailable") {
+		t.Fatalf("generateWrapper resolver error = %q", got)
 	}
 }

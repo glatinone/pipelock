@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,6 +32,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/blockreason"
 	"github.com/luckyPipewrench/pipelock/internal/capture"
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/envelope"
 	"github.com/luckyPipewrench/pipelock/internal/killswitch"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/receipt"
@@ -317,6 +319,19 @@ func dialWSConn(proxyAddr, backendAddr string) (net.Conn, error) {
 	return dialWSConnWithHeader(proxyAddr, backendAddr, nil)
 }
 
+func dialWSConnToTarget(proxyAddr, targetURL string) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	wsURL := fmt.Sprintf("ws://%s/ws?url=%s", proxyAddr, url.QueryEscape(targetURL))
+	dialer := ws.Dialer{Extensions: nil}
+	conn, _, _, err := dialer.Dial(ctx, wsURL)
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
+}
+
 func dialWSConnWithHeader(proxyAddr, backendAddr string, header http.Header) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -487,7 +502,7 @@ func TestWSProxyEcho(t *testing.T) {
 	defer proxyCleanup()
 
 	conn := dialWS(t, proxyAddr, backendAddr)
-	defer conn.Close() //nolint:errcheck // test
+	defer func() { _ = conn.Close() }()
 
 	// Send a text message.
 	msg := []byte("hello websocket proxy")
@@ -1628,6 +1643,182 @@ func TestWSProxyInjectionWarn(t *testing.T) {
 	}
 	if !strings.Contains(string(reply), "ignore") {
 		t.Errorf("expected injection payload to be forwarded in warn mode, got %q", reply)
+	}
+}
+
+func TestWSProxyInjectionWarn_ContaminatesSessionBeforeSensitiveAction(t *testing.T) {
+	backendAddr, backendCleanup := wsInjectionServer(t)
+	defer backendCleanup()
+
+	proxyAddr, p, proxyCleanup := setupWSProxyDefaultWithProxy(t, func(cfg *config.Config) {
+		cfg.ResponseScanning.Enabled = true
+		cfg.ResponseScanning.Action = config.ActionWarn
+		cfg.SessionProfiling.Enabled = true
+	})
+	defer proxyCleanup()
+
+	const agent = "named-agent"
+	conn, err := dialWSConnWithHeader(proxyAddr, backendAddr, http.Header{"X-Pipelock-Agent": {agent}})
+	if err != nil {
+		t.Fatalf("ws dial: %v", err)
+	}
+	defer conn.Close() //nolint:errcheck // test
+	if err := wsutil.WriteClientMessage(conn, ws.OpText, []byte(testWSHello)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, _, err := wsutil.ReadServerData(conn); err != nil {
+		t.Fatalf("read warn-mode injection: %v", err)
+	}
+	reloaded := p.CurrentConfig().Clone()
+	reloaded.KillSwitch.Message = "unrelated reload"
+	if !p.Reload(reloaded, scanner.MustNew(reloaded)) {
+		t.Fatal("unrelated reload failed")
+	}
+
+	sm := p.sessionMgrPtr.Load()
+	if sm == nil {
+		t.Fatal("session manager not initialized")
+	}
+	sess := sm.GetOrCreate(ceeSessionKey(agent, "127.0.0.1", envelope.ActorAuthSelfDeclared))
+	if risk := sess.RiskSnapshot(); !risk.Contaminated {
+		t.Fatal("WebSocket injection finding left the session falsely clean")
+	}
+	target, err := url.Parse("https://api.vendor.example/auth/update")
+	if err != nil {
+		t.Fatalf("parse sensitive target: %v", err)
+	}
+	decision := evaluateHTTPTaint(p.CurrentConfig(), sess, http.MethodPost, target)
+	if decision.Result.Decision != session.PolicyBlock {
+		t.Fatalf("sensitive follow-up decision = %v, want block", decision.Result.Decision)
+	}
+}
+
+// TestWSProxyResponseTaintControls covers the observation controls. Read the
+// "clean trusted response" case narrowly: the backend is 127.0.0.1, which
+// ClassifyURLSource pins to TaintTrusted via isTrustedLocalhost before the
+// allowlist is ever consulted, so wantTainted=false there follows from the
+// target being localhost and NOT from the payload being clean. A clean frame
+// from a non-allowlisted host classifies TaintExternalUntrusted and does set
+// Contaminated; only PromptHit distinguishes clean from injected content here.
+func TestWSProxyResponseTaintControls(t *testing.T) {
+	tests := []struct {
+		name          string
+		injection     bool
+		responseScan  bool
+		taintEnabled  bool
+		wantTainted   bool
+		wantPromptHit bool
+	}{
+		{name: "clean trusted response", responseScan: true, taintEnabled: true},
+		{name: "injection response", injection: true, responseScan: true, taintEnabled: true, wantTainted: true, wantPromptHit: true},
+		{name: "taint disabled", injection: true, responseScan: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var backendAddr string
+			var backendCleanup func()
+			if tt.injection {
+				backendAddr, backendCleanup = wsInjectionServer(t)
+			} else {
+				backendAddr, backendCleanup = wsEchoServer(t)
+			}
+			defer backendCleanup()
+
+			proxyAddr, p, proxyCleanup := setupWSProxyDefaultWithProxy(t, func(cfg *config.Config) {
+				cfg.ResponseScanning.Enabled = tt.responseScan
+				cfg.ResponseScanning.Action = config.ActionWarn
+				cfg.SessionProfiling.Enabled = true
+				cfg.Taint.Enabled = tt.taintEnabled
+			})
+			defer proxyCleanup()
+
+			conn := dialWS(t, proxyAddr, backendAddr)
+			defer func() { _ = conn.Close() }()
+			if err := wsutil.WriteClientMessage(conn, ws.OpText, []byte(testWSHello)); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if _, _, err := wsutil.ReadServerData(conn); err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+
+			sess := p.sessionMgrPtr.Load().GetOrCreate(sessionKeyFor(agentAnonymous, "127.0.0.1"))
+			risk := sess.RiskSnapshot()
+			if risk.Contaminated != tt.wantTainted {
+				t.Fatalf("contaminated = %v, want %v", risk.Contaminated, tt.wantTainted)
+			}
+			if risk.PromptHit != tt.wantPromptHit {
+				t.Fatalf("prompt hit = %v, want %v", risk.PromptHit, tt.wantPromptHit)
+			}
+		})
+	}
+}
+
+func TestWSRelayResponseTaint_ReResolvesEvictedSession(t *testing.T) {
+	_, p, cleanup := setupWSProxyDefaultWithProxy(t, func(cfg *config.Config) {
+		cfg.SessionProfiling.Enabled = true
+		cfg.SessionProfiling.MaxSessions = 1
+	})
+	defer cleanup()
+
+	key := ceeSessionKey("named-agent", "127.0.0.1", envelope.ActorAuthSelfDeclared)
+	relay := &wsRelay{
+		proxy:           p,
+		cfg:             p.CurrentConfig(),
+		targetURL:       "wss://socket.vendor.example/events",
+		taintSessionKey: key,
+	}
+	relay.observeUpstreamResponseTaint(false)
+	sm := p.sessionMgrPtr.Load()
+	original := sm.GetOrCreate(key)
+	if !original.RiskSnapshot().Contaminated {
+		t.Fatal("first external WebSocket response did not contaminate session")
+	}
+	sm.GetOrCreate("evict-response-taint-session")
+
+	relay.observeUpstreamResponseTaint(true)
+	current := sm.GetOrCreate(key)
+	if current == original {
+		t.Fatal("test did not evict the original session")
+	}
+	if risk := current.RiskSnapshot(); !risk.PromptHit || risk.Level != session.TaintExternalHostile {
+		t.Fatalf("recreated session risk = %+v, want hostile prompt hit", risk)
+	}
+}
+
+func TestWSRelayResponseTaint_DeduplicatesBySourceAndPromptState(t *testing.T) {
+	_, p, cleanup := setupWSProxyDefaultWithProxy(t, func(cfg *config.Config) {
+		cfg.SessionProfiling.Enabled = true
+		cfg.Taint.RecentSources = 10
+	})
+	defer cleanup()
+
+	const key = "websocket-response-dedup"
+	relay := &wsRelay{
+		proxy:           p,
+		cfg:             p.CurrentConfig(),
+		targetURL:       "wss://first.vendor.example/events",
+		taintSessionKey: key,
+	}
+	relay.observeUpstreamResponseTaint(false)
+	relay.observeUpstreamResponseTaint(false)
+	relay.observeUpstreamResponseTaint(true)
+	relay.observeUpstreamResponseTaint(true)
+
+	relay.targetURL = "wss://second.vendor.example/events"
+	relay.observeUpstreamResponseTaint(true)
+	relay.observeUpstreamResponseTaint(true)
+
+	risk := p.sessionMgrPtr.Load().GetOrCreate(key).RiskSnapshot()
+	if len(risk.Sources) != 3 {
+		t.Fatalf("response sources = %+v, want one clean and two prompt observations", risk.Sources)
+	}
+	if risk.Sources[0].URL != "wss://first.vendor.example/events" || risk.Sources[0].MatchReason != "" {
+		t.Fatalf("first source = %+v, want clean observation", risk.Sources[0])
+	}
+	for i, source := range risk.Sources[1:] {
+		if source.MatchReason != "prompt_injection_pattern" {
+			t.Fatalf("prompt source %d = %+v, want prompt match reason", i, source)
+		}
 	}
 }
 
@@ -4062,6 +4253,67 @@ func TestWSProxyCEEEntropyBlocked(t *testing.T) {
 	// Must not block on the first message - proves accumulation, not single-frame blocking.
 	if blockedAt == 0 {
 		t.Fatalf("CEE blocked on first message (budget 100 bits should require multiple frames)")
+	}
+}
+
+func TestWebSocketHandshake_CEEPathFragmentsBlockSecondUpgrade(t *testing.T) {
+	backendAddr, handshakes, _, _ := websocketBoundaryBackend(t)
+	proxyAddr, proxyCleanup := setupWSProxy(t, func(cfg *config.Config) {
+		cfg.CrossRequestDetection.Enabled = true
+		cfg.CrossRequestDetection.Action = config.ActionBlock
+		cfg.CrossRequestDetection.EntropyBudget.Enabled = false
+		cfg.CrossRequestDetection.FragmentReassembly.Enabled = true
+		// Defaults() does not normalize these values. A zero cap would silently
+		// trim every fragment and make this handler-level regression vacuous.
+		cfg.CrossRequestDetection.FragmentReassembly.MaxBufferBytes = 65536
+		cfg.CrossRequestDetection.FragmentReassembly.WindowMinutes = 5
+	})
+	defer proxyCleanup()
+
+	half1, half2 := pathSecretHalves()
+	first, err := dialWSConnToTarget(proxyAddr, "ws://"+backendAddr+"/upload/"+half1)
+	if err != nil {
+		t.Fatalf("first incomplete handshake failed: %v", err)
+	}
+	defer func() { _ = first.Close() }()
+
+	if _, err := dialWSConnToTarget(proxyAddr, "ws://"+backendAddr+"/upload/"+half2); err == nil {
+		t.Fatal("second path fragment completed a WebSocket upgrade")
+	}
+	if got := handshakes.Load(); got != 1 {
+		t.Fatalf("upstream handshakes = %d, want only the first incomplete handshake", got)
+	}
+}
+
+func TestWebSocketHandshake_CEEPathWarnEscalatesBlockAll(t *testing.T) {
+	backendAddr, handshakes, _, _ := websocketBoundaryBackend(t)
+	proxyAddr, proxyCleanup := setupWSProxy(t, func(cfg *config.Config) {
+		cfg.CrossRequestDetection.Enabled = true
+		cfg.CrossRequestDetection.Action = config.ActionWarn
+		cfg.CrossRequestDetection.EntropyBudget.Enabled = false
+		cfg.CrossRequestDetection.FragmentReassembly.Enabled = true
+		cfg.CrossRequestDetection.FragmentReassembly.MaxBufferBytes = 65536
+		cfg.CrossRequestDetection.FragmentReassembly.WindowMinutes = 5
+		cfg.SessionProfiling.Enabled = true
+		cfg.SessionProfiling.MaxSessions = 100
+		cfg.AdaptiveEnforcement.Enabled = true
+		cfg.AdaptiveEnforcement.EscalationThreshold = 3
+		cfg.AdaptiveEnforcement.Levels.Elevated.BlockAll = ptrBool(true)
+	})
+	defer proxyCleanup()
+
+	half1, half2 := pathSecretHalves()
+	first, err := dialWSConnToTarget(proxyAddr, "ws://"+backendAddr+"/upload/"+half1)
+	if err != nil {
+		t.Fatalf("first incomplete handshake failed: %v", err)
+	}
+	defer func() { _ = first.Close() }()
+
+	if _, err := dialWSConnToTarget(proxyAddr, "ws://"+backendAddr+"/upload/"+half2); err == nil {
+		t.Fatal("warn-mode CEE match did not escalate the completing handshake to block_all")
+	}
+	if got := handshakes.Load(); got != 1 {
+		t.Fatalf("upstream handshakes = %d, want only the first incomplete handshake", got)
 	}
 }
 

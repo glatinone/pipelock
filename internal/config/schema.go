@@ -142,6 +142,11 @@ const (
 
 	DefaultSizeExemptScanMaxBytes         = 64 * 1024 * 1024
 	DefaultSizeExemptScanMaxInflightBytes = 256 * 1024 * 1024
+	// DefaultReverseProxyMaxInflightScanBytes limits the buffered request
+	// bodies a single reverse-proxy instance can hold while inspecting them.
+	// It permits twelve default-sized (5 MiB) uploads at once while keeping the
+	// process-wide admission cost bounded.
+	DefaultReverseProxyMaxInflightScanBytes = 64 * 1024 * 1024
 
 	// DefaultMaxGap is the default maximum number of non-matching tool calls
 	// allowed between consecutive steps in a chain pattern.
@@ -464,10 +469,13 @@ type Config struct {
 	SSRF             SSRF     `yaml:"ssrf"`
 	DNS              DNS      `yaml:"dns"`
 
-	// LicenseExpiresAt is the Unix timestamp of the license expiry, populated
-	// by EnforceLicenseGate(). Zero means perpetual. Used for runtime expiry
-	// enforcement so agents are disabled even without a config reload.
-	LicenseExpiresAt int64 `yaml:"-"`
+	// LicenseExpiresAt, LicenseIssuedAt, and LicenseTier are claims from the
+	// verified license token, populated at runtime. They are used for expiry
+	// enforcement and lifetime-aware warning messages, never parsed from YAML.
+	// A zero expiry means perpetual.
+	LicenseExpiresAt int64  `yaml:"-"`
+	LicenseIssuedAt  int64  `yaml:"-" json:"-"`
+	LicenseTier      string `yaml:"-" json:"-"`
 	// LicenseID and CRL metadata are runtime-derived from the verified
 	// license token and CRL. They are excluded from policy serialization.
 	LicenseID               string `yaml:"-" json:"-"`
@@ -814,6 +822,55 @@ func MCPResponseActionForTrust(trust string) string {
 	}
 }
 
+// StricterAction returns whichever of a and b is stronger under the canonical
+// action ordering shared with the reload-downgrade warnings, so a trust/section
+// comparison can never disagree with an old/new comparison about which of two
+// actions is stronger.
+//
+// An action this package cannot rank is not evidence about strength, so an
+// unrankable side yields the other side rather than silently winning. When
+// neither side ranks, a is returned: every caller passes the trust-derived
+// action there, and that mapping is itself fail-closed.
+func StricterAction(a, b string) string {
+	aStrength, aOK := reloadActionStrength(a)
+	bStrength, bOK := reloadActionStrength(b)
+	switch {
+	case !aOK && !bOK:
+		return a
+	case !aOK:
+		return b
+	case !bOK:
+		return a
+	case bStrength > aStrength:
+		return b
+	default:
+		return a
+	}
+}
+
+// MCPResponseActionForServer returns the effective MCP response-scan action for
+// serverName: the trust class mapping, clamped so it can only ever be stricter
+// than the enclosing response_scanning.action.
+//
+// Trust is allowed to tighten scanning and never to relax it. Without the clamp
+// a reasoning-class server silently downgraded a configured block section to
+// warn, because the trust-derived action was applied as an unconditional
+// override. An untrusted server under a warn section still blocks, because that
+// is trust being stricter.
+//
+// A nil config resolves to the untrusted class, matching per-server lookup.
+func (c *Config) MCPResponseActionForServer(serverName string) string {
+	trust := ResponseTrustUntrusted
+	sectionAction := ""
+	if c != nil {
+		if configuredTrust, ok := c.MCPResponseTrustForServer(serverName); ok {
+			trust = configuredTrust
+		}
+		sectionAction = c.ResponseScanning.Action
+	}
+	return StricterAction(MCPResponseActionForTrust(trust), sectionAction)
+}
+
 // GenericSSEScanning configures inline body scanning of non-A2A
 // text/event-stream responses (OpenAI chat completions, Anthropic
 // messages, OpenAI-compatible gateways, generic LLM SSE). When disabled the proxy
@@ -922,6 +979,12 @@ type ReverseProxy struct {
 	// min(MaxBodyBytes, request_body_scanning.max_body_bytes); requests
 	// exceeding the cap return 413 BEFORE forwarding.
 	MaxBodyBytes int64 `yaml:"max_body_bytes"`
+
+	// MaxInflightScanBytes caps the total configured request-body scan
+	// reservations held by this reverse-proxy instance. It prevents concurrent
+	// uploads from multiplying buffered-body memory; a request is rejected
+	// before its body is read when insufficient capacity remains.
+	MaxInflightScanBytes int `yaml:"max_inflight_scan_bytes"`
 
 	// RequestTimeoutSeconds bounds total per-request time including upstream
 	// dial + body forwarding. Required positive when profile is "submit".

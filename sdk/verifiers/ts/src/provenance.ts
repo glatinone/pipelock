@@ -10,6 +10,9 @@ import unicode15LowercaseMap from "@unicode/unicode-15.0.0/Simple_Case_Mapping/L
 /** The pinned, fixture-only evidence-provenance transform profile. */
 export const EVIDENCE_PROVENANCE_PROFILE_V1_DIGEST =
   "sha256:3de14968449593cae58da869cfc97855cb098e491494390a12ba742cb0b70f94";
+export const EVIDENCE_PROVENANCE_PROFILE_V2_DIGEST =
+  "sha256:01e022d444562a25591cd379e894f5f6cde9eda9527fb92af2330373a25e7af7";
+type ProfileVersion = "v1" | "v2";
 
 const MAX_INPUT_BYTES = 2 << 20;
 const MAX_OUTPUT_BYTES = 1 << 20;
@@ -45,10 +48,18 @@ const kinds = new Set([
   "hostname_dot_remove",
   "encoded_run",
   "canary_canonicalize",
+  "ascii_alphanumeric_strip",
 ]);
 
 export function supportedOperationKinds(): string[] {
   return [...kinds];
+}
+
+export function supportedOperationKindsForProfile(digest: string): string[] {
+  const profile = resolveEvidenceProvenanceProfile(digest);
+  return profile === "v1"
+    ? [...kinds].filter((kind) => kind !== "ascii_alphanumeric_strip")
+    : [...kinds];
 }
 
 /** Unicode 15.0.0's Simple_Lowercase_Mapping table, pinned by dependency. */
@@ -172,6 +183,15 @@ function assertFields(op: Record<string, unknown>, kind: string, allowed: readon
   }
 }
 
+function resolveEvidenceProvenanceProfile(digest: unknown): ProfileVersion {
+  if (digest === undefined || digest === "") fail("recipe: missing transform profile digest");
+  if (typeof digest !== "string" || !/^sha256:[0-9a-f]{64}$/u.test(digest))
+    fail("recipe: transform profile digest: invalid SHA-256 digest");
+  if (digest === EVIDENCE_PROVENANCE_PROFILE_V1_DIGEST) return "v1";
+  if (digest === EVIDENCE_PROVENANCE_PROFILE_V2_DIGEST) return "v2";
+  fail("recipe: transform profile digest: unknown profile");
+}
+
 /** Validates an untrusted JSON recipe before any source bytes are transformed. */
 export function validateEvidenceProvenanceRecipe(
   recipe: unknown,
@@ -179,15 +199,7 @@ export function validateEvidenceProvenanceRecipe(
   if (recipe === null || typeof recipe !== "object" || Array.isArray(recipe))
     fail("recipe must be an object");
   const r = recipe as Record<string, unknown>;
-  if (r.transform_profile_digest === undefined || r.transform_profile_digest === "")
-    fail("recipe: missing transform profile digest");
-  if (
-    typeof r.transform_profile_digest !== "string" ||
-    !/^sha256:[0-9a-f]{64}$/u.test(r.transform_profile_digest)
-  )
-    fail("recipe: transform profile digest: invalid SHA-256 digest");
-  if (r.transform_profile_digest !== EVIDENCE_PROVENANCE_PROFILE_V1_DIGEST)
-    fail("recipe: transform profile digest: unknown profile");
+  const profile = resolveEvidenceProvenanceProfile(r.transform_profile_digest);
   if (!Array.isArray(r.operations)) fail("recipe: operations must be an array");
   if (r.operations.length > MAX_OPERATIONS) fail(`recipe: exceeds ${MAX_OPERATIONS} operations`);
   for (const [index, raw] of r.operations.entries()) {
@@ -197,6 +209,8 @@ export function validateEvidenceProvenanceRecipe(
     const kind = opString(op, "kind", true)!;
     if (!kinds.has(kind)) fail(`recipe operation ${index} (${kind}): unknown operation`);
     validateOperation(op, kind);
+    if (kind === "ascii_alphanumeric_strip" && profile !== "v2")
+      fail(`recipe operation ${index} (${kind}): unsupported by transform profile`);
   }
 }
 
@@ -218,6 +232,7 @@ function validateOperation(op: Record<string, unknown>, kind: string): void {
     case "ordered_query_concat":
     case "hostname_dot_remove":
     case "canary_canonicalize":
+    case "ascii_alphanumeric_strip":
       assertFields(op, kind, none);
       return;
     case "url_component": {
@@ -309,6 +324,7 @@ export function applyEvidenceProvenanceRecipe(
   const source = text(input, "recipe input");
   if (input.length > MAX_INPUT_BYTES) fail("recipe input: exceeds profile byte limit");
   validateEvidenceProvenanceRecipe(recipe);
+  const profile = resolveEvidenceProvenanceProfile(recipe.transform_profile_digest);
   let value = source;
   let remaining = MAX_CUMULATIVE_PROCESSED_BYTES;
   const charge = (processed: string): void => {
@@ -321,7 +337,7 @@ export function applyEvidenceProvenanceRecipe(
     const op = raw as Record<string, unknown>;
     try {
       charge(value);
-      value = apply(value, op, charge);
+      value = apply(value, op, charge, profile);
     } catch (error) {
       if (error instanceof Error && error.name === "FixtureWorkLimit") throw error;
       throw new Error(
@@ -509,7 +525,57 @@ function matching(value: string): string {
     ),
   );
 }
-function encodedToken(value: string, alphabet: string): string {
+// Deny-list mirroring scanner.go's normalizeHex (alphabet === "hex") and
+// normalizeEncodedToken/isEncodedTokenByte (other alphabets): keep only the
+// target alphabet's own data characters and drop everything else as noise.
+// A character outside the alphabet no longer aborts normalization to "" --
+// every non-data character is now strippable, not just an enumerated
+// separator set.
+function encodedToken(value: string, alphabet: string, profile: ProfileVersion): string {
+  if (profile === "v1") return encodedTokenV1(value, alphabet);
+  return encodedTokenV2(value, alphabet);
+}
+function encodedTokenV2(value: string, alphabet: string): string {
+  if (value.length < 4) return "";
+  if (alphabet === "hex") {
+    const stripped = stripV2HexPrefixes(value);
+    // A separator is punctuation or whitespace, never a letter, so an
+    // out-of-alphabet letter means prose rather than a split token.
+    if (/[g-wy-zG-WY-Z]/u.test(stripped)) return "";
+    const v = stripped.replace(/[^0-9a-fA-F]/gu, "");
+    return v.length && v.length % 2 === 0 ? v : "";
+  }
+  const data =
+    alphabet === "base32"
+      ? /^[A-Z2-7=]$/u
+      : alphabet === "base64_standard"
+        ? /^[A-Za-z0-9+/=]$/u
+        : /^[A-Za-z0-9_\-=]$/u;
+  let changed = false,
+    result = "";
+  for (const c of value) {
+    if (data.test(c)) result += c;
+    else changed = true;
+  }
+  return changed && result.length >= 4 ? result : "";
+}
+function stripV2HexPrefixes(value: string): string {
+  let result = "";
+  for (let index = 0; index < value.length; index += 1) {
+    if (
+      index + 3 < value.length &&
+      (value[index] === "0" || value[index] === "\\") &&
+      (value[index + 1] === "x" || value[index + 1] === "X") &&
+      /^[0-9a-fA-F]{2}$/u.test(value.slice(index + 2, index + 4))
+    ) {
+      index += 1;
+      continue;
+    }
+    result += value[index];
+  }
+  return result;
+}
+function encodedTokenV1(value: string, alphabet: string): string {
   if (value.length < 4) return "";
   if (alphabet === "hex") {
     const v = value
@@ -584,6 +650,7 @@ function apply(
   value: string,
   op: Record<string, unknown>,
   charge: (value: string) => void,
+  profile: ProfileVersion,
 ): string {
   const kind = op.kind as string;
   switch (kind) {
@@ -661,7 +728,7 @@ function apply(
         false,
       );
     case "encoded_token_normalize":
-      return encodedToken(value, op.alphabet as string);
+      return encodedToken(value, op.alphabet as string, profile);
     case "text_segment": {
       const segments = value.split(/[/?&= \n\r\t"'`{}\[\]()<>:,;]/u).filter(Boolean);
       const occurrence = (op.occurrence as number | undefined) ?? 0;
@@ -673,7 +740,9 @@ function apply(
     case "whitespace_compact":
       return compactUnicode15Whitespace(value);
     case "url_noise_strip":
-      return value.replace(/[./ \t\n\r+,;|]/gu, "");
+      return profile === "v1"
+        ? value.replace(/[./ \t\n\r+,;|]/gu, "")
+        : value.replace(/[^A-Za-z0-9\-_=]/gu, "");
     case "ordered_query_concat":
       return value
         .split("&")
@@ -704,6 +773,8 @@ function apply(
     }
     case "canary_canonicalize":
       return value.replace(/[./\\?&= \t\n\r:;,\-_@%+#]/gu, "");
+    case "ascii_alphanumeric_strip":
+      return value.replace(/[^A-Za-z0-9]/gu, "");
     default:
       return fail(`unknown operation ${JSON.stringify(kind)}`);
   }

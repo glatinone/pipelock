@@ -181,6 +181,7 @@ servers are skipped (idempotent). A .bak backup is created before modification.
 Non-server fields (inputs, sandbox) are preserved.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Args:          cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runVscodeInstall(cmd, global, project, dryRun, configFile)
 		},
@@ -209,6 +210,7 @@ pipelock install. Original server configurations are restored from the
 _pipelock metadata field. Non-wrapped servers are left unchanged.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Args:          cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runVscodeRemove(cmd, global, project, dryRun)
 		},
@@ -304,10 +306,11 @@ func runVscodeInstall(cmd *cobra.Command, global, project, dryRun bool, configFi
 	skipped := 0
 	var sidecarOps []sidecarOp
 	for name, server := range mcpCfg.Servers {
-		if isVscodeWrapped(server) {
+		if isWrappedBySelf(server) {
 			skipped++
 			continue
 		}
+		warnForeignWrapper(cmd.ErrOrStderr(), name, server)
 
 		newServer, meta, plan, err := wrapVscodeServer(server, exe, configFile, targetPath, name)
 		if err != nil {
@@ -412,11 +415,12 @@ func runVscodeRemove(cmd *cobra.Command, global, project, dryRun bool) error {
 	unwrapped := 0
 	var sidecarOps []sidecarOp
 	for name, server := range mcpCfg.Servers {
-		if !isVscodeWrapped(server) {
+		if !isRestorableWrapper(server) {
+			warnUnrestorableWrapper(cmd.ErrOrStderr(), name, server)
 			continue
 		}
 
-		restored, plan, err := unwrapVscodeServer(server)
+		restored, plan, err := unwrapVscodeServer(server, targetPath, name)
 		if err != nil {
 			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not unwrap %q: %v\n", name, err)
 			continue
@@ -479,14 +483,7 @@ const (
 // (anything that is not stdio).
 func isVscodeHTTPType(t string) bool { return t != vsTypeStdio && t != "" }
 
-// isVscodeWrapped returns true if a server entry has pipelock metadata.
-func isVscodeWrapped(server map[string]interface{}) bool {
-	_, ok := server["_pipelock"]
-	return ok
-}
-
-// wrapVscodeServer wraps a single VS Code MCP server through pipelock mcp proxy.
-// wrapVscodeServer wraps a single MCP server entry through pipelock mcp proxy.
+// wrapVscodeServer wraps a single VS Code family MCP server through pipelock mcp proxy.
 // targetConfigPath + serverName are used to derive the per-server 0o600 header
 // sidecar file when the entry carries an HTTP `headers` block; the wrapped
 // argv references it via --header-file so credential header values never
@@ -611,7 +608,15 @@ func wrapVscodeServer(server map[string]interface{}, exe, configFile, targetConf
 // disk; otherwise a marshal / atomic-write failure later in the remove path
 // would leave the still-wrapped config on disk while the credential carrier
 // it references is gone.
-func unwrapVscodeServer(server map[string]interface{}) (map[string]interface{}, *sidecarOp, error) {
+//
+// The delete target is DERIVED from targetConfigPath and serverName, never
+// taken from the metadata. A project-local config controls its own _pipelock
+// marker, so a metadata-supplied path is attacker-controlled input: since
+// every server's sidecar shares one directory, containment checks alone still
+// let a config for one server nominate an unrelated server's credential file
+// for deletion. The metadata path is still shape-checked so obviously tampered
+// markers fail closed and stay visible, but it never selects the file removed.
+func unwrapVscodeServer(server map[string]interface{}, targetConfigPath, serverName string) (map[string]interface{}, *sidecarOp, error) {
 	metaRaw, ok := server["_pipelock"]
 	if !ok {
 		return server, nil, nil
@@ -629,7 +634,10 @@ func unwrapVscodeServer(server map[string]interface{}) (map[string]interface{}, 
 
 	var plan *sidecarOp
 	if meta.HeaderSidecarPath != "" {
-		path, err := validatedHeaderSidecarDeletePath(meta.HeaderSidecarPath)
+		if _, err := validatedHeaderSidecarDeletePath(meta.HeaderSidecarPath); err != nil {
+			return nil, nil, err
+		}
+		path, err := headerSidecarPath(targetConfigPath, serverName)
 		if err != nil {
 			return nil, nil, err
 		}

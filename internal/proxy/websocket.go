@@ -25,6 +25,7 @@ import (
 
 	"github.com/luckyPipewrench/pipelock/internal/addressprotect"
 	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/authority"
 	"github.com/luckyPipewrench/pipelock/internal/blockreason"
 	"github.com/luckyPipewrench/pipelock/internal/capture"
 	"github.com/luckyPipewrench/pipelock/internal/config"
@@ -78,6 +79,7 @@ type wsRelay struct {
 	reqPolicyPath    string
 	redactionLog     *redact.Report
 	rec              session.Recorder // live escalation level for UpgradeAction; nil when profiling disabled
+	taintSessionKey  string           // rotation-safe key re-resolved for every response observation
 	terminalOnce     sync.Once        // ensures only one terminal receipt (kill_switch/session_deny) is emitted across concurrent relay goroutines
 
 	// lastActivity is the shared idle clock, updated by BOTH relay directions
@@ -195,6 +197,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Strip inbound mediation envelope headers after optional trust
 	// verification so forged mediation metadata cannot survive to upstreams.
 	envelope.StripInbound(r.Header)
+	authorityRef, authorityCarrierErr := consumeAuthorityHeader(r)
 	sc, releaseScanner, scOK := p.pinResolvedScanner(resolved)
 	defer releaseScanner()
 	if !scOK {
@@ -560,6 +563,67 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// CEE handshake admission: the WebSocket target path is outbound data just
+	// like a fetch or forward-proxy path. Frames are handled below after the
+	// upgrade; this pre-upgrade check catches a secret split across two target
+	// URLs before the second upstream handshake is dialed.
+	ceeAdmission := p.admitCurrentCEE(r.Context(), ceeAdmitRequest{
+		SessionKey: ceeSessionKey(agent, clientIP, id.Auth), PathPayload: pathSegments(parsed),
+		TargetURL: targetURL, Agent: agent, ClientIP: clientIP, RequestID: requestID, IncludeFragments: true,
+	})
+	if ceeAdmission.Active {
+		ceeRes := ceeAdmission.Result
+		ceeKey := ceeSessionKey(agent, clientIP, id.Auth)
+		ceeRec, ceeBlockAll := ceeRecordSignalsAndBlockAll(ceeSignalParams{
+			Result: ceeRes, Sessions: ceeAdmission.Sessions, SessionKey: ceeKey,
+			AdaptiveCfg: &ceeAdmission.AdaptiveConfig, Logger: log, Metrics: p.metrics,
+			ClientIP: clientIP, RequestID: requestID,
+		})
+
+		if ceeRes.Blocked {
+			log.LogWSBlocked(targetURL, audit.DirectionClientToServer, "cross_request", ceeRes.Reason, clientIP, requestID)
+			p.metrics.RecordWSBlocked()
+			emitWebSocketReceipt(receipt.EmitOpts{
+				ActionID:   receipt.NewActionID(),
+				Verdict:    config.ActionBlock,
+				Layer:      "cross_request",
+				PolicyHash: ceeAdmission.PolicyHash,
+				Pattern:    ceeRes.Reason,
+				Transport:  TransportWS,
+				Method:     "WS",
+				Target:     targetURL,
+				RequestID:  requestID,
+				Agent:      agent,
+			})
+			writeBlockedError(w,
+				blockInfoFor(blockreason.CrossRequestDeny, "cross_request"),
+				"WebSocket blocked: "+ceeRes.Reason, http.StatusForbidden)
+			return
+		}
+
+		if ceeBlockAll {
+			level := recEscalationLevel(ceeRec)
+			recordAdaptiveUpgrade(log, p.metrics, adaptiveUpgrade{SessionKey: ceeKey, Level: session.EscalationLabel(level), FromAction: "", ToAction: config.ActionBlock, Scanner: adaptiveSessionDeny, ClientIP: clientIP, RequestID: requestID})
+			p.metrics.RecordWSBlocked()
+			emitWebSocketReceipt(receipt.EmitOpts{
+				ActionID:   receipt.NewActionID(),
+				Verdict:    config.ActionBlock,
+				Layer:      adaptiveSessionDeny,
+				PolicyHash: ceeAdmission.PolicyHash,
+				Pattern:    "session escalation level " + session.EscalationLabel(level),
+				Transport:  TransportWS,
+				Method:     "WS",
+				Target:     targetURL,
+				RequestID:  requestID,
+				Agent:      agent,
+			})
+			writeBlockedError(w,
+				blockInfoFor(blockreason.EscalationLevel, adaptiveSessionDeny),
+				"WebSocket "+adaptiveBlockedReason, http.StatusForbidden)
+			return
+		}
+	}
+
 	// request_policy runs before the contract gate so a contract allow can
 	// never suppress an operation-policy block. The upgrade carries no
 	// operation body, so body-predicate (GraphQL / discriminator) rules defer
@@ -700,6 +764,33 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+	}
+	if err := p.authorizeForward(r.Context(), authorityRef, authorityCarrierErr, authority.Request{
+		Actor:       agent,
+		Action:      string(receipt.ActionDelegate),
+		Destination: targetURL,
+	}, actx, TransportWS); err != nil {
+		emitWebSocketReceipt(receipt.EmitOpts{
+			ActionID:  actionID,
+			Verdict:   config.ActionBlock,
+			Layer:     blockLayerAuthority,
+			Pattern:   "authority verification failed",
+			Transport: TransportWS,
+			Method:    "WS",
+			Target:    targetURL,
+			RequestID: requestID,
+			Agent:     agent,
+		})
+		p.metrics.RecordWSBlocked()
+		if clientConn != nil {
+			plwsutil.WriteCloseFrame(clientConn, ws.StatusPolicyViolation,
+				blockInfoFor(blockreason.AuthorityMismatch, blockLayerAuthority).CloseFramePayload())
+		} else {
+			writeBlockedError(w,
+				blockInfoFor(blockreason.AuthorityMismatch, blockLayerAuthority),
+				"WebSocket blocked: authority verification failed", http.StatusForbidden)
+		}
+		return
 	}
 
 	// Inject mediation envelope after all admission checks but before the
@@ -889,24 +980,25 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	relay := &wsRelay{
-		clientConn:   clientConn,
-		upstreamConn: upstreamConn,
-		scanner:      sc,
-		proxy:        p,
-		cfg:          cfg,
-		redaction:    p.currentRedactionRuntimeFor(cfg),
-		agent:        agent,
-		metricAgent:  id.Profile,
-		actorAuth:    id.Auth,
-		clientIP:     clientIP,
-		requestID:    requestID,
-		targetURL:    targetURL,
-		hostname:     strings.ToLower(parsed.Hostname()),
-		path:         parsed.Path,
-		maxMsg:       cfg.WebSocketProxy.MaxMessageBytes,
-		scanText:     scanTextFrames,
-		allowBinary:  cfg.WebSocketProxy.AllowBinaryFrames,
-		rec:          wsRec,
+		clientConn:      clientConn,
+		upstreamConn:    upstreamConn,
+		scanner:         sc,
+		proxy:           p,
+		cfg:             cfg,
+		redaction:       p.currentRedactionRuntimeFor(cfg),
+		agent:           agent,
+		metricAgent:     id.Profile,
+		actorAuth:       id.Auth,
+		clientIP:        clientIP,
+		requestID:       requestID,
+		targetURL:       targetURL,
+		hostname:        strings.ToLower(parsed.Hostname()),
+		path:            parsed.Path,
+		maxMsg:          cfg.WebSocketProxy.MaxMessageBytes,
+		scanText:        scanTextFrames,
+		allowBinary:     cfg.WebSocketProxy.AllowBinaryFrames,
+		rec:             wsRec,
+		taintSessionKey: responseTaintSessionKey(agent, clientIP, id.Auth),
 	}
 	// Per-frame request_policy reuses the handshake route inputs: the escaped
 	// path the handshake gate matched on and a clone of the upgrade headers (for
@@ -1117,11 +1209,41 @@ func (p *Proxy) wsDialUpstream(ctx context.Context, targetURL string, fwdHeaders
 		Extensions: nil, // disable permessage-deflate; relay does not handle compressed frames
 	}
 
-	conn, _, _, err := dialer.Dial(dialCtx, targetURL)
+	conn, reader, _, err := dialer.Dial(dialCtx, targetURL)
 	if err != nil {
 		return nil, err
 	}
+	if reader != nil {
+		buffered := reader.Buffered()
+		if buffered > 0 {
+			prefix, peekErr := reader.Peek(buffered)
+			if peekErr != nil {
+				ws.PutReader(reader)
+				_ = conn.Close()
+				return nil, fmt.Errorf("preserve post-handshake WebSocket bytes: %w", peekErr)
+			}
+			preserved := bytes.Clone(prefix)
+			ws.PutReader(reader)
+			return &wsDialPrefixedConn{Conn: conn, prefix: bytes.NewReader(preserved)}, nil
+		}
+		ws.PutReader(reader)
+	}
 	return conn, nil
+}
+
+// wsDialPrefixedConn drains bytes received alongside the upstream HTTP upgrade
+// response before reading the socket. Copying the prefix lets wsDialUpstream
+// return gobwas's pooled reader while it still has exclusive ownership.
+type wsDialPrefixedConn struct {
+	net.Conn
+	prefix *bytes.Reader
+}
+
+func (c *wsDialPrefixedConn) Read(p []byte) (int, error) {
+	if c.prefix.Len() > 0 {
+		return c.prefix.Read(p)
+	}
+	return c.Conn.Read(p)
 }
 
 // run starts bidirectional frame relay. Returns stats when both directions complete.
@@ -1229,6 +1351,84 @@ func (r *wsRelay) scanClientMessageBody(ctx context.Context, msg []byte) ([]byte
 	applyContentEntropyConfig(&bodyReq, r.cfg, r.cfg.WebSocketProxy.ContentEntropyExclusions)
 	applyBodyScanRedaction(&bodyReq, r.redaction)
 	return scanRequestBody(ctx, bodyReq)
+}
+
+// enforceClientControlPayload scans Ping and Pong application data without
+// transforming it. Control payloads are opaque keepalive bytes with a strict
+// 125-byte limit, so redaction or stripping would break protocol semantics.
+func (r *wsRelay) enforceClientControlPayload(ctx context.Context, log *audit.Logger, payload []byte, controlTail *[]byte) bool {
+	if len(payload) == 0 || !r.scanText {
+		return false
+	}
+
+	prevTail := *controlTail
+	scanInput := payload
+	if len(prevTail) > 0 {
+		scanInput = make([]byte, 0, len(prevTail)+len(payload))
+		scanInput = append(scanInput, prevTail...)
+		scanInput = append(scanInput, payload...)
+	}
+	*controlTail = updateWSCrossMessageTail(prevTail, payload)
+
+	if r.scanClientText(ctx, log, scanInput) {
+		return true
+	}
+	if joined, ok := joinLabeledWSCrossMessageSuffixes(prevTail, payload); ok && r.scanClientText(ctx, log, joined) {
+		return true
+	}
+	return false
+}
+
+func (r *wsRelay) enforceClientCEE(ctx context.Context, log *audit.Logger, msg []byte, includeFragments bool) bool {
+	ceeAdmission := r.proxy.admitCurrentCEE(ctx, ceeAdmitRequest{
+		SessionKey: ceeSessionKey(r.agent, r.clientIP, r.actorAuth), Outbound: msg,
+		TargetURL: r.targetURL, Agent: r.agent, ClientIP: r.clientIP, RequestID: r.requestID,
+		IncludeFragments: includeFragments,
+	})
+	if !ceeAdmission.Active {
+		return false
+	}
+
+	ceeRes := ceeAdmission.Result
+	sessionKey := ceeSessionKey(r.agent, r.clientIP, r.actorAuth)
+	var ceeRec session.Recorder
+	var ceeBlockAll bool
+	if sm := ceeAdmission.Sessions; sm != nil {
+		ceeRec, ceeBlockAll = ceeRecordSignalsAndBlockAll(ceeSignalParams{
+			Result: ceeRes, Sessions: sm, SessionKey: sessionKey,
+			AdaptiveCfg: &ceeAdmission.AdaptiveConfig, Logger: r.proxy.logger, Metrics: r.proxy.metrics,
+			ClientIP: r.clientIP, RequestID: r.requestID,
+		})
+	}
+
+	if ceeRes.Blocked {
+		log.LogWSBlocked(r.targetURL, audit.DirectionClientToServer, "cross_request", ceeRes.Reason, r.clientIP, r.requestID)
+		r.proxy.metrics.RecordWSScanHit("cross_request")
+		_ = r.emitReceipt(receipt.EmitOpts{
+			ActionID: receipt.NewActionID(), Verdict: config.ActionBlock, Layer: "cross_request",
+			PolicyHash: ceeAdmission.PolicyHash, Pattern: ceeRes.Reason, Transport: TransportWS,
+			Method: "WS", Target: r.targetURL, RequestID: r.requestID, Agent: r.agent,
+		})
+		plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, "cross-request exfiltration detected")
+		plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "cross-request exfiltration detected")
+		return true
+	}
+
+	if ceeBlockAll {
+		level := recEscalationLevel(ceeRec)
+		recordAdaptiveUpgrade(log, r.proxy.metrics, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(level), FromAction: "", ToAction: config.ActionBlock, Scanner: adaptiveSessionDeny, ClientIP: r.clientIP, RequestID: r.requestID})
+		r.terminalOnce.Do(func() {
+			_ = r.emitReceipt(receipt.EmitOpts{
+				ActionID: receipt.NewActionID(), Verdict: config.ActionBlock, Layer: adaptiveSessionDeny,
+				Pattern: "session escalation", Transport: TransportWS, Method: "WS", Target: r.targetURL,
+				RequestID: r.requestID, Agent: r.agent, PolicyHash: ceeAdmission.PolicyHash,
+			})
+		})
+		plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, adaptiveBlockedReason)
+		plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, adaptiveBlockedReason)
+		return true
+	}
+	return false
 }
 
 func updateWSCrossMessageTail(tail []byte, msg []byte) []byte {
@@ -1827,7 +2027,8 @@ func (r *wsRelay) handleClientMessageBodyResult(log *audit.Logger, bodyBytes []b
 func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFunc, idleTimeout time.Duration) (bytesTransferred, textFrames, binaryFrames int64, blocked bool) {
 	defer cancel()
 	frag := &plwsutil.FragmentState{MaxBytes: r.maxMsg}
-	var crossMsgTail []byte // rolling tail for cross-message DLP scanning
+	var crossMsgTail []byte   // rolling tail for text-message DLP scanning
+	var controlMsgTail []byte // separate tail for Ping/Pong payload DLP scanning
 	log := r.proxy.logger.With("agent", r.agent)
 	redactionEnabled := r.redaction != nil && r.redaction.required
 
@@ -1962,11 +2163,15 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 
 		r.proxy.metrics.RecordWSFrame(opCodeLabel(hdr.OpCode))
 
-		// Control frames: forward as-is.
+		// Control frames.
 		if hdr.OpCode.IsControl() {
 			if hdr.OpCode == ws.OpClose {
 				// Forward close frame to upstream, then exit.
 				plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusNormalClosure, "client closed")
+				return
+			}
+			if r.enforceClientControlPayload(ctx, log, payload, &controlMsgTail) {
+				blocked = true
 				return
 			}
 			// Ping/Pong: forward to upstream (proxy is CLIENT to upstream).
@@ -1974,6 +2179,7 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 			if err != nil {
 				return
 			}
+			bytesTransferred += int64(len(payload))
 			continue
 		}
 
@@ -2114,71 +2320,9 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 		// Entropy tracking applies to all frame types (text + binary) since
 		// binary frames can carry high-entropy exfiltrated data. Fragment
 		// buffering only applies to text frames (DLP patterns match text).
-		ceeAdmission := r.proxy.admitCurrentCEE(ctx, ceeAdmitRequest{
-			SessionKey: ceeSessionKey(r.agent, r.clientIP, r.actorAuth), Outbound: msg,
-			TargetURL: r.targetURL, Agent: r.agent, ClientIP: r.clientIP, RequestID: r.requestID,
-			IncludeFragments: frag.Opcode == ws.OpText || hdr.OpCode == ws.OpText,
-		})
-		if ceeAdmission.Active {
-			ceeRes := ceeAdmission.Result
-			sessionKey := ceeSessionKey(r.agent, r.clientIP, r.actorAuth)
-
-			var ceeRec session.Recorder
-			var ceeBlockAll bool
-			if sm := ceeAdmission.Sessions; sm != nil {
-				ceeRec, ceeBlockAll = ceeRecordSignalsAndBlockAll(ceeSignalParams{
-					Result: ceeRes, Sessions: sm, SessionKey: sessionKey,
-					AdaptiveCfg: &ceeAdmission.AdaptiveConfig, Logger: r.proxy.logger, Metrics: r.proxy.metrics,
-					ClientIP: r.clientIP, RequestID: r.requestID,
-				})
-			}
-
-			if ceeRes.Blocked {
-				log.LogWSBlocked(r.targetURL, audit.DirectionClientToServer, "cross_request", ceeRes.Reason, r.clientIP, r.requestID)
-				r.proxy.metrics.RecordWSScanHit("cross_request")
-				_ = r.emitReceipt(receipt.EmitOpts{
-					ActionID:   receipt.NewActionID(),
-					Verdict:    config.ActionBlock,
-					Layer:      "cross_request",
-					PolicyHash: ceeAdmission.PolicyHash,
-					Pattern:    ceeRes.Reason,
-					Transport:  TransportWS,
-					Method:     "WS",
-					Target:     r.targetURL,
-					RequestID:  r.requestID,
-					Agent:      r.agent,
-				})
-				plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, "cross-request exfiltration detected")
-				plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "cross-request exfiltration detected")
-				blocked = true
-				return
-			}
-
-			// Re-check block_all against the folded CEE session after warn-mode
-			// CEE findings may have escalated it. r.rec is the raw per-agent
-			// recorder and may not receive CEE signals for self-declared names.
-			if ceeBlockAll {
-				level := recEscalationLevel(ceeRec)
-				recordAdaptiveUpgrade(log, r.proxy.metrics, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(level), FromAction: "", ToAction: config.ActionBlock, Scanner: adaptiveSessionDeny, ClientIP: r.clientIP, RequestID: r.requestID})
-				r.terminalOnce.Do(func() {
-					_ = r.emitReceipt(receipt.EmitOpts{
-						ActionID:   receipt.NewActionID(),
-						Verdict:    config.ActionBlock,
-						Layer:      adaptiveSessionDeny,
-						Pattern:    "session escalation",
-						Transport:  TransportWS,
-						Method:     "WS",
-						Target:     r.targetURL,
-						RequestID:  r.requestID,
-						Agent:      r.agent,
-						PolicyHash: ceeAdmission.PolicyHash,
-					})
-				})
-				plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, adaptiveBlockedReason)
-				plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, adaptiveBlockedReason)
-				blocked = true
-				return
-			}
+		if r.enforceClientCEE(ctx, log, msg, frag.Opcode == ws.OpText || hdr.OpCode == ws.OpText) {
+			blocked = true
+			return
 		}
 
 		// Forward complete message to upstream (proxy is CLIENT, so masked).
@@ -2193,6 +2337,118 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 		bytesTransferred += int64(len(msg))
 		frag.Reset()
 	}
+}
+
+// enforceUpstreamTextPayload applies response injection policy to any textual
+// WebSocket payload, including Ping and Pong application data.
+func (r *wsRelay) enforceUpstreamTextPayload(ctx context.Context, log *audit.Logger, msg []byte, allowTransform bool) ([]byte, bool) {
+	const responseScanLayer = "response_scan"
+
+	if len(msg) == 0 {
+		return msg, false
+	}
+	if !r.scanText || !r.scanner.ResponseScanningEnabled() {
+		r.observeUpstreamResponseTaint(false)
+		return msg, false
+	}
+
+	// Exempt domains are still scanned for visibility but findings are pinned
+	// to warn with no adaptive scoring or action upgrade.
+	wsRespExempt := isResponseScanExempt(r.hostname, r.cfg.ResponseScanning.ExemptDomains)
+	scanResult := r.scanner.ScanResponseWithSuppress(ctx, string(msg), r.targetURL, r.cfg.Suppress)
+	r.observeUpstreamResponseTaint(!scanResult.Clean)
+	recordSuppressedResponseScanExempts(r.proxy.metrics, scanResult.SuppressedMatches, TransportWS)
+	if scanResult.Clean {
+		return msg, false
+	}
+	if wsRespExempt {
+		r.proxy.metrics.RecordResponseScanExempt(ExemptReasonDomain, TransportWS)
+	}
+	patternNames := make([]string, len(scanResult.Matches))
+	for i, match := range scanResult.Matches {
+		patternNames[i] = match.PatternName
+	}
+	respBundleRules := responseBundleRules(scanResult.Matches)
+	r.proxy.metrics.RecordWSScanHit("injection")
+
+	wsAction := r.scanner.ResponseAction()
+	if wsRespExempt {
+		wsAction = config.ActionWarn
+	}
+	originalWSAction := wsAction
+	if !wsRespExempt {
+		wsAction = decide.UpgradeAction(wsAction, r.escalationLevel(), &r.cfg.AdaptiveEnforcement)
+	}
+	if wsAction != originalWSAction {
+		sessionKey := sessionKeyFor(r.agent, r.clientIP)
+		recordAdaptiveUpgrade(log, r.proxy.metrics, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(r.escalationLevel()), FromAction: originalWSAction, ToAction: wsAction, Scanner: responseScanLayer, ClientIP: r.clientIP, RequestID: r.requestID})
+	}
+
+	switch wsAction {
+	case config.ActionBlock:
+		reason := fmt.Sprintf("injection detected: %s", strings.Join(patternNames, ", "))
+		log.LogWSBlocked(r.targetURL, audit.DirectionServerToClient, responseScanLayer, reason, r.clientIP, r.requestID)
+		_ = r.emitReceipt(receipt.EmitOpts{
+			ActionID: receipt.NewActionID(), Verdict: config.ActionBlock, Layer: responseScanLayer, Pattern: reason,
+			Transport: TransportWS, Method: "WS", Target: r.targetURL, RequestID: r.requestID, Agent: r.agent,
+		})
+		plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, "injection detected")
+		plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "injection detected")
+		return nil, true
+	case config.ActionStrip:
+		if !wsRespExempt {
+			r.recordSignal(session.SignalStrip, log)
+		}
+		if !allowTransform || scanResult.TransformedContent == "" {
+			reason := fmt.Sprintf("injection detected (strip failed): %s", strings.Join(patternNames, ", "))
+			log.LogWSBlocked(r.targetURL, audit.DirectionServerToClient, responseScanLayer, reason, r.clientIP, r.requestID)
+			_ = r.emitReceipt(receipt.EmitOpts{
+				ActionID: receipt.NewActionID(), Verdict: config.ActionBlock, Layer: responseScanLayer, Pattern: reason,
+				Transport: TransportWS, Method: "WS", Target: r.targetURL, RequestID: r.requestID, Agent: r.agent,
+			})
+			plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, "injection detected")
+			plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "injection detected")
+			return nil, true
+		}
+		msg = []byte(scanResult.TransformedContent)
+		log.LogWSScan(audit.WSScanEvent{Target: r.targetURL, Direction: audit.DirectionServerToClient, ClientIP: r.clientIP, RequestID: r.requestID, Agent: r.agent, Action: config.ActionStrip, MatchCount: len(scanResult.Matches), PatternNames: patternNames, BundleRules: respBundleRules})
+	case config.ActionWarn:
+		log.LogWSScan(audit.WSScanEvent{Target: r.targetURL, Direction: audit.DirectionServerToClient, ClientIP: r.clientIP, RequestID: r.requestID, Agent: r.agent, Action: config.ActionWarn, MatchCount: len(scanResult.Matches), PatternNames: patternNames, BundleRules: respBundleRules})
+	case config.ActionAsk:
+		reason := fmt.Sprintf("injection detected (ask not supported for WS): %s", strings.Join(patternNames, ", "))
+		log.LogWSBlocked(r.targetURL, audit.DirectionServerToClient, responseScanLayer, reason, r.clientIP, r.requestID)
+		_ = r.emitReceipt(receipt.EmitOpts{
+			ActionID: receipt.NewActionID(), Verdict: config.ActionBlock, Layer: responseScanLayer, Pattern: reason,
+			Transport: TransportWS, Method: "WS", Target: r.targetURL, RequestID: r.requestID, Agent: r.agent,
+		})
+		plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, "injection detected")
+		plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "injection detected")
+		return nil, true
+	default:
+		log.LogWSScan(audit.WSScanEvent{Target: r.targetURL, Direction: audit.DirectionServerToClient, ClientIP: r.clientIP, RequestID: r.requestID, Agent: r.agent, Action: wsAction, MatchCount: len(scanResult.Matches), PatternNames: patternNames, BundleRules: respBundleRules})
+	}
+	return msg, false
+}
+
+func (r *wsRelay) observeUpstreamResponseTaint(promptHit bool) {
+	if r.cfg == nil || !r.cfg.Taint.Enabled {
+		return
+	}
+	sm := r.proxy.sessionMgrPtr.Load()
+	if sm == nil || r.taintSessionKey == "" {
+		return
+	}
+	rec := sm.GetOrCreate(r.taintSessionKey)
+	risk := rec.RiskSnapshot()
+	for _, source := range risk.Sources {
+		if source.URL != r.targetURL || source.Kind != "websocket_response" {
+			continue
+		}
+		if !promptHit || source.MatchReason == "prompt_injection_pattern" {
+			return
+		}
+	}
+	observeHTTPResponseTaint(rec, r.cfg, r.targetURL, "application/websocket", "websocket_response", promptHit)
 }
 
 // upstreamToClient reads frames from upstream, injection-scans text, writes to client.
@@ -2336,11 +2592,17 @@ func (r *wsRelay) upstreamToClient(ctx context.Context, cancel context.CancelFun
 				plwsutil.WriteCloseFrame(r.clientConn, ws.StatusNormalClosure, "upstream closed")
 				return
 			}
+			payload, responseBlocked := r.enforceUpstreamTextPayload(ctx, log, payload, false)
+			if responseBlocked {
+				blocked = true
+				return
+			}
 			// Forward Ping/Pong to client (proxy is SERVER to client, no masking).
 			err = wsutil.WriteServerMessage(r.clientConn, hdr.OpCode, payload)
 			if err != nil {
 				return
 			}
+			bytesTransferred += int64(len(payload))
 			continue
 		}
 
@@ -2402,6 +2664,7 @@ func (r *wsRelay) upstreamToClient(ctx context.Context, cancel context.CancelFun
 
 		// Complete message. Count and scan.
 		if opCode == ws.OpBinary {
+			r.observeUpstreamResponseTaint(false)
 			actx := newHTTPAuditContext(log, "WS", r.targetURL, r.clientIP, r.requestID, r.agent)
 			mediaVerdict := applyMediaPolicy(r.cfg, "", msg)
 			logMediaExposureIfPresent(log, actx, mediaVerdict, TransportWS)
@@ -2440,121 +2703,11 @@ func (r *wsRelay) upstreamToClient(ctx context.Context, cancel context.CancelFun
 				return
 			}
 
-			// Response injection scanning.
-			// Exempt domains are still scanned for visibility but findings are
-			// pinned to warn with no adaptive scoring or action upgrade.
-			wsRespExempt := isResponseScanExempt(r.hostname, r.cfg.ResponseScanning.ExemptDomains)
-			if r.scanText && r.scanner.ResponseScanningEnabled() {
-				scanResult := r.scanner.ScanResponseWithSuppress(ctx, string(msg), r.targetURL, r.cfg.Suppress)
-				recordSuppressedResponseScanExempts(r.proxy.metrics, scanResult.SuppressedMatches, TransportWS)
-				if !scanResult.Clean {
-					if wsRespExempt {
-						r.proxy.metrics.RecordResponseScanExempt(ExemptReasonDomain, TransportWS)
-					}
-					patternNames := make([]string, len(scanResult.Matches))
-					for i, m := range scanResult.Matches {
-						patternNames[i] = m.PatternName
-					}
-					respBundleRules := responseBundleRules(scanResult.Matches)
-					r.proxy.metrics.RecordWSScanHit("injection")
-
-					// Adaptive enforcement: upgrade the response action before the switch.
-					// Exempt domains: pin to warn, skip upgrade.
-					wsAction := r.scanner.ResponseAction()
-					if wsRespExempt {
-						wsAction = config.ActionWarn
-					}
-					originalWSAction := wsAction
-					if !wsRespExempt {
-						wsAction = decide.UpgradeAction(wsAction, r.escalationLevel(), &r.cfg.AdaptiveEnforcement)
-					}
-					if wsAction != originalWSAction {
-						sessionKey := sessionKeyFor(r.agent, r.clientIP)
-						recordAdaptiveUpgrade(log, r.proxy.metrics, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(r.escalationLevel()), FromAction: originalWSAction, ToAction: wsAction, Scanner: "response_scan", ClientIP: r.clientIP, RequestID: r.requestID})
-					}
-
-					switch wsAction {
-					case config.ActionBlock:
-						reason := fmt.Sprintf("injection detected: %s", strings.Join(patternNames, ", "))
-						log.LogWSBlocked(r.targetURL, audit.DirectionServerToClient, "response_scan", reason, r.clientIP, r.requestID)
-						_ = r.emitReceipt(receipt.EmitOpts{
-							ActionID:  receipt.NewActionID(),
-							Verdict:   config.ActionBlock,
-							Layer:     "response_scan",
-							Pattern:   reason,
-							Transport: TransportWS,
-							Method:    "WS",
-							Target:    r.targetURL,
-							RequestID: r.requestID,
-							Agent:     r.agent,
-						})
-						plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, "injection detected")
-						plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "injection detected")
-						blocked = true
-						return
-					case config.ActionStrip:
-						// Record SignalStrip for adaptive enforcement scoring.
-						// Exempt domains skip scoring - findings are logged but don't escalate.
-						if !wsRespExempt {
-							r.recordSignal(session.SignalStrip, log)
-						}
-						if scanResult.TransformedContent != "" {
-							msg = []byte(scanResult.TransformedContent)
-						} else {
-							// Cannot strip, fall back to block.
-							reason := fmt.Sprintf("injection detected (strip failed): %s", strings.Join(patternNames, ", "))
-							log.LogWSBlocked(r.targetURL, audit.DirectionServerToClient, "response_scan", reason, r.clientIP, r.requestID)
-							plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, "injection detected")
-							plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "injection detected")
-							blocked = true
-							return
-						}
-						log.LogWSScan(audit.WSScanEvent{
-							Target:       r.targetURL,
-							Direction:    audit.DirectionServerToClient,
-							ClientIP:     r.clientIP,
-							RequestID:    r.requestID,
-							Agent:        r.agent,
-							Action:       config.ActionStrip,
-							MatchCount:   len(scanResult.Matches),
-							PatternNames: patternNames,
-							BundleRules:  respBundleRules,
-						})
-					case config.ActionWarn:
-						log.LogWSScan(audit.WSScanEvent{
-							Target:       r.targetURL,
-							Direction:    audit.DirectionServerToClient,
-							ClientIP:     r.clientIP,
-							RequestID:    r.requestID,
-							Agent:        r.agent,
-							Action:       config.ActionWarn,
-							MatchCount:   len(scanResult.Matches),
-							PatternNames: patternNames,
-							BundleRules:  respBundleRules,
-						})
-					case config.ActionAsk:
-						// HITL not supported for WebSocket (no request/response cycle).
-						// Fail closed: block.
-						reason := fmt.Sprintf("injection detected (ask not supported for WS): %s", strings.Join(patternNames, ", "))
-						log.LogWSBlocked(r.targetURL, audit.DirectionServerToClient, "response_scan", reason, r.clientIP, r.requestID)
-						plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, "injection detected")
-						plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "injection detected")
-						blocked = true
-						return
-					default:
-						log.LogWSScan(audit.WSScanEvent{
-							Target:       r.targetURL,
-							Direction:    audit.DirectionServerToClient,
-							ClientIP:     r.clientIP,
-							RequestID:    r.requestID,
-							Agent:        r.agent,
-							Action:       wsAction,
-							MatchCount:   len(scanResult.Matches),
-							PatternNames: patternNames,
-							BundleRules:  respBundleRules,
-						})
-					}
-				}
+			var responseBlocked bool
+			msg, responseBlocked = r.enforceUpstreamTextPayload(ctx, log, msg, true)
+			if responseBlocked {
+				blocked = true
+				return
 			}
 		}
 

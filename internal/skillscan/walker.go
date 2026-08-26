@@ -14,6 +14,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/luckyPipewrench/pipelock/internal/securefile"
 )
 
 const (
@@ -28,6 +30,18 @@ const (
 )
 
 var referencedPathPattern = regexp.MustCompile("(?:^|[[:space:]\"'`])((?:\\.{1,2}/)?[A-Za-z0-9_./-]+\\.(?:sh|bash|zsh|py|js|ts|mjs|go|rb|pl|yaml|yml|json|toml))")
+
+// referencedRelativePattern catches a referenced file that carries no
+// recognized extension, such as a `./bootstrap` launcher. It requires an
+// explicit ./ or ../ marker so ordinary prose naming a bare word cannot
+// promote that word to a referenced file; the containment and existence
+// checks in loadReferencedFiles then bound it further.
+var referencedRelativePattern = regexp.MustCompile("(?:^|[[:space:]\"'`])(\\.{1,2}/[A-Za-z0-9_.][A-Za-z0-9_./-]*)")
+
+// referenceTrailingPunctuation is trimmed from a matched relative path so a
+// reference at the end of a sentence resolves to the file rather than to the
+// filename plus the sentence's punctuation.
+const referenceTrailingPunctuation = ".,;:!?)]}'\""
 
 type fileContent struct {
 	path    string
@@ -45,6 +59,11 @@ type skillInput struct {
 	refFiles  []ReferencedFile
 	scanFiles []string
 	oversize  []string
+
+	// uninspectable records paths that exist but were not read, so refusing or
+	// failing to inspect content cannot present as a clean skill. Oversize
+	// files already report this way; see FindingOversize.
+	uninspectable []uninspectableRef
 }
 
 func DefaultLockFile() string {
@@ -195,9 +214,15 @@ func loadSkill(path string) (skillInput, error) {
 		}
 		return input, nil
 	}
-	data, grew, err := readScanFile(clean)
+	data, grew, refusedSkill, err := readScanFile(clean, info)
 	if err != nil {
 		return skillInput{}, fmt.Errorf("read %s: %w", clean, err)
+	}
+	if refusedSkill != "" {
+		// The skill file itself IS the inventory. Refusing to read it is not a
+		// partial result to step over, so it stops this skill rather than
+		// yielding an entry that reads as an inspected skill with no content.
+		return skillInput{}, fmt.Errorf("read %s: %s", clean, refusedSkill)
 	}
 	if grew {
 		input.oversize = append(input.oversize, clean)
@@ -219,6 +244,17 @@ func loadSkill(path string) (skillInput, error) {
 	return input, nil
 }
 
+// markUninspectable records a referenced dependency the scanner refused to read.
+// Both refusals route here - a path that is not a regular file, and a path whose
+// identity changed under an open descriptor - so a dependency we decline to
+// inspect never presents as clean, which is how oversize files already behave.
+func (s *skillInput) markUninspectable(path, reason string) {
+	s.uninspectable = append(s.uninspectable, uninspectableRef{
+		path:   filepath.Clean(path),
+		reason: reason,
+	})
+}
+
 func (s *skillInput) loadReferencedFiles() error {
 	refs := referencedFilesFromSkill(s.root, string(s.content))
 	for rel := range referencedDirs(s.root) {
@@ -235,16 +271,42 @@ func (s *skillInput) loadReferencedFiles() error {
 		if err != nil {
 			continue
 		}
+		if info.IsDir() {
+			// A referenced directory is not an uninspected dependency: the
+			// scripts, bin and hooks directories are walked deliberately by
+			// referencedDirs, and prose pointing at a documentation directory
+			// must not gate a scan.
+			continue
+		}
+		// Every way of refusing to inspect a dependency converges on one
+		// disposition below. The path exists but is not a regular file, or the
+		// bytes opened were not the file that was checked. A dependency we
+		// refuse to read must not present as clean, which is how oversize files
+		// already behave. A failed Lstat above is deliberately NOT recorded: a
+		// named path that does not exist is prose or a stale doc reference, not
+		// an uninspected dependency, and reporting it would flag ordinary
+		// writing.
+		refused := ""
 		if !info.Mode().IsRegular() {
-			continue
+			refused = "not a regular file; a symlink is not followed because its target can leave the skill directory"
 		}
-		if info.Size() > maxScanFileBytes {
-			s.oversize = append(s.oversize, filepath.Clean(path))
-			continue
+		var (
+			data []byte
+			grew bool
+		)
+		if refused == "" {
+			if info.Size() > maxScanFileBytes {
+				s.oversize = append(s.oversize, filepath.Clean(path))
+				continue
+			}
+			data, grew, refused, err = readScanFile(filepath.Clean(path), info)
+			if err != nil {
+				return fmt.Errorf("read referenced file %s: %w", path, err)
+			}
 		}
-		data, grew, err := readScanFile(filepath.Clean(path))
-		if err != nil {
-			return fmt.Errorf("read referenced file %s: %w", path, err)
+		if refused != "" {
+			s.markUninspectable(path, refused)
+			continue
 		}
 		if grew {
 			s.oversize = append(s.oversize, filepath.Clean(path))
@@ -267,16 +329,55 @@ func (s *skillInput) loadReferencedFiles() error {
 
 func referencedFilesFromSkill(root, content string) map[string]struct{} {
 	refs := map[string]struct{}{}
-	for _, match := range referencedPathPattern.FindAllStringSubmatch(content, -1) {
-		if len(match) < 2 {
-			continue
-		}
-		rel, ok := containedRelativePath(root, match[1])
-		if ok {
-			refs[rel] = struct{}{}
+	for _, pattern := range []*regexp.Regexp{referencedPathPattern, referencedRelativePattern} {
+		// Both patterns carry exactly one capture group, so every match has the
+		// full text at 0 and the path at 1.
+		for _, match := range pattern.FindAllStringSubmatch(content, -1) {
+			for _, candidate := range referenceCandidates(root, match[1]) {
+				refs[candidate] = struct{}{}
+			}
 		}
 	}
 	return refs
+}
+
+// referenceCandidates resolves one matched reference to the relative path worth
+// scanning, or nothing. The exact match is tried FIRST, because a trailing dot
+// and a leading dot are both legal in a filename: "./bootstrap." and
+// "./.bootstrap" name real files, and trimming or rejecting them dropped those
+// files from the scanned set, the referenced set and the lock. Punctuation
+// trimming is only a fallback for a reference that ends a sentence, and applies
+// solely when the exact candidate does not resolve inside the skill.
+func referenceCandidates(root, match string) []string {
+	if rel, ok := resolvedInsideSkill(root, match); ok {
+		return []string{rel}
+	}
+	if trimmed := strings.TrimRight(match, referenceTrailingPunctuation); trimmed != match {
+		if rel, ok := resolvedInsideSkill(root, trimmed); ok {
+			return []string{rel}
+		}
+	}
+	// Neither form exists on disk. Keep the exact match so a broken reference is
+	// recorded as named, rather than silently rewritten to another path.
+	if rel, ok := containedRelativePath(root, match); ok {
+		return []string{rel}
+	}
+	return nil
+}
+
+// resolvedInsideSkill returns the contained relative path when a candidate names
+// something that exists within the skill directory. It uses Lstat, so a symlink
+// counts as existing without being followed here; whether it may be READ is
+// decided later.
+func resolvedInsideSkill(root, candidate string) (string, bool) {
+	rel, ok := containedRelativePath(root, candidate)
+	if !ok {
+		return "", false
+	}
+	if _, err := os.Lstat(filepath.Clean(filepath.Join(root, filepath.FromSlash(rel)))); err != nil {
+		return "", false
+	}
+	return rel, true
 }
 
 func referencedDirs(root string) map[string]struct{} {
@@ -315,26 +416,109 @@ func containedRelativePath(root, candidate string) (string, bool) {
 		return "", false
 	}
 	rel, err := filepath.Rel(absRoot, absPath)
-	if err != nil || strings.HasPrefix(rel, "..") || rel == "." {
+	// Reject traversal on a path COMPONENT boundary, not on a string prefix. A
+	// filename may legitimately begin with two dots, so "..bootstrap" is a
+	// contained file while ".." and "../x" are escapes. The prefix form treated
+	// the filename as traversal and dropped it from the scan and the lock.
+	if err != nil || rel == "." || rel == ".." ||
+		strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	if !parentChainContained(absRoot, absPath) {
 		return "", false
 	}
 	return filepath.ToSlash(rel), true
 }
 
-func readScanFile(path string) ([]byte, bool, error) {
-	f, err := os.Open(filepath.Clean(path))
+// parentChainContained re-checks containment after resolving symlinks in the
+// candidate PARENT chain.
+//
+// The comparison above is lexical: it treats a path as text and never asks
+// whether a component of it is a symlink. A skill referencing "payload/data.sh"
+// where "payload" links to a directory outside the skill passes that check and
+// is read, so containment is satisfied by a path that does not stay inside the
+// skill.
+//
+// Only the parent chain is resolved, deliberately. Resolving the FINAL
+// component too would reject a symlinked reference here, which reads as
+// stricter but is worse: that case is currently recorded as an uninspectable
+// dependency, and rejecting it at containment would delete the finding instead
+// of reporting it.
+//
+// An unresolvable root or parent keeps the lexical answer. That is not a hole:
+// a parent that cannot be resolved cannot be opened either, so no bytes are
+// read, and the read itself is now bound to the validated inode.
+func parentChainContained(absRoot, absPath string) bool {
+	realRoot, err := filepath.EvalSymlinks(absRoot)
 	if err != nil {
-		return nil, false, err
+		return true
+	}
+	realParent, err := filepath.EvalSymlinks(filepath.Dir(absPath))
+	if err != nil {
+		return true
+	}
+	rel, err := filepath.Rel(realRoot, realParent)
+	if err != nil {
+		return false
+	}
+	// rel == "." is contained here: the parent IS the skill root.
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// readScanFile reads path, refusing to return bytes from anything other than
+// the regular file described by want.
+//
+// Validating with Lstat and then reading with os.Open are two operations on a
+// PATH, and os.Open follows symlinks. A path replaced with a symlink in the
+// window between them is read through, so the scanner would inspect content
+// outside the skill directory while its own contract says a symlink is never
+// followed. Re-stat the OPEN DESCRIPTOR instead: that names the inode actually
+// being read and cannot be re-pointed underneath us.
+func readScanFile(path string, want os.FileInfo) (data []byte, grew bool, refused string, err error) {
+	// securefile owns the platform matrix for a nonblocking open and is already
+	// exercised against a real FIFO. Reuse it rather than adding a second matrix
+	// here that drifts from that one.
+	//
+	// Its final-component behavior is NOT uniform, so the descriptor check below
+	// is what carries this guarantee rather than the open. On Unix the open also
+	// carries O_NOFOLLOW, which narrows the window further: a path swapped to a
+	// symlink fails to open rather than opening the wrong file. On Windows a
+	// final symlink inside the root is followed, and the identity comparison is
+	// then the only thing standing between us and reading its target. Do not
+	// remove that comparison on the grounds that the open is no-follow.
+	f, err := securefile.OpenRegularNonblocking(filepath.Clean(path))
+	if err != nil {
+		// Every open failure is a refusal rather than a broken scan. Lstat has
+		// already said this is a regular file, so failing to open it means it
+		// changed underneath us or cannot be reached: unreadable permissions, a
+		// path swapped to a symlink that O_NOFOLLOW then rejects, a device or
+		// FIFO, the file being removed, or a platform that provides no secure
+		// open at all. Each one is this single dependency cannot be inspected,
+		// and aborting on any of them hands anyone who can write a skill
+		// directory a way to stop the scan of every OTHER skill.
+		//
+		// Refusing does not make an unopenable file quiet. Each one becomes a
+		// high-severity uninspectable finding naming the path and the reason,
+		// so a platform that can open nothing fails loudly per file rather than
+		// silently, and no unread path presents as clean.
+		return nil, false, "could not be opened for inspection, so its content is unknown", nil
 	}
 	defer func() { _ = f.Close() }()
-	data, err := io.ReadAll(io.LimitReader(f, maxScanFileBytes+1))
-	if err != nil {
-		return nil, false, err
+	got, statErr := f.Stat()
+	if statErr != nil {
+		return nil, false, "", statErr
 	}
-	if len(data) > maxScanFileBytes {
-		return nil, true, nil
+	if !got.Mode().IsRegular() || !os.SameFile(want, got) {
+		return nil, false, "changed identity between validation and read; the bytes opened were not the regular file that was checked", nil
 	}
-	return data, false, nil
+	body, readErr := io.ReadAll(io.LimitReader(f, maxScanFileBytes+1))
+	if readErr != nil {
+		return nil, false, "", readErr
+	}
+	if len(body) > maxScanFileBytes {
+		return nil, true, "", nil
+	}
+	return body, false, "", nil
 }
 
 func splitLines(content string) []string {

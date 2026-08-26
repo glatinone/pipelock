@@ -37,8 +37,11 @@ go install github.com/luckyPipewrench/pipelock/cmd/pipelock@latest
 # 2. Wrap every Codex MCP server with pipelock in one shot
 pipelock codex install
 
-# 3. Run an assessment before first use
-pipelock assess init --config configs/balanced.yaml
+# 3. Generate a config to work from
+pipelock generate config --preset balanced -o pipelock.yaml
+
+# 4. Run an assessment before first use
+pipelock assess init --config pipelock.yaml
 pipelock assess run assessment-*/
 pipelock assess finalize assessment-*/
 ```
@@ -56,7 +59,7 @@ For manual / per-server control, the original pattern still works:
 
 ```bash
 codex mcp add my-server \
-  -- pipelock mcp proxy --config configs/balanced.yaml \
+  -- pipelock mcp proxy --config pipelock.yaml \
   -- npx -y @modelcontextprotocol/server-filesystem /tmp
 ```
 
@@ -75,17 +78,17 @@ Codex  <-->  pipelock mcp proxy  <-->  MCP Server
 ```bash
 # Wrap a filesystem server
 codex mcp add filesystem \
-  -- pipelock mcp proxy --config configs/balanced.yaml \
+  -- pipelock mcp proxy --config pipelock.yaml \
   -- npx -y @modelcontextprotocol/server-filesystem ~/projects
 
 # Wrap a database server
 codex mcp add postgres \
-  -- pipelock mcp proxy --config configs/balanced.yaml \
+  -- pipelock mcp proxy --config pipelock.yaml \
   -- npx -y @modelcontextprotocol/server-postgres postgresql://localhost/mydb
 
 # Wrap a remote MCP server (Streamable HTTP)
 codex mcp add remote-tools \
-  -- pipelock mcp proxy --config configs/balanced.yaml \
+  -- pipelock mcp proxy --config pipelock.yaml \
   --upstream http://localhost:8080/mcp
 ```
 
@@ -98,7 +101,7 @@ Codex stores MCP server config in `~/.codex/config.toml`:
 command = "pipelock"
 args = [
   "mcp", "proxy",
-  "--config", "/home/you/.config/pipelock/balanced.yaml",
+  "--config", "/home/you/pipelock.yaml",
   "--",
   "npx", "-y", "@modelcontextprotocol/server-filesystem", "/home/you/projects"
 ]
@@ -120,7 +123,7 @@ fetch), run pipelock as a forward proxy:
 
 ```bash
 # Start the proxy
-pipelock run --config configs/balanced.yaml &
+pipelock run --config pipelock.yaml &
 
 # Set the proxy for Codex sessions
 export HTTPS_PROXY=http://127.0.0.1:8888
@@ -141,7 +144,7 @@ Think of it as a background check before the agent starts work.
 
 ```bash
 # Initialize an assessment session
-pipelock assess init --config configs/balanced.yaml
+pipelock assess init --config pipelock.yaml
 
 # Run attack simulations
 pipelock assess run assessment-*/
@@ -173,22 +176,27 @@ For maximum containment, use both:
 
 ```bash
 # Codex sandbox + pipelock sandbox on MCP server
+pipelock generate config --preset strict -o pipelock-strict.yaml
 codex mcp add secure-filesystem \
-  -- pipelock mcp proxy --config configs/strict.yaml --sandbox \
+  -- pipelock mcp proxy --config pipelock-strict.yaml --sandbox \
   -- npx -y @modelcontextprotocol/server-filesystem /tmp
 ```
 
 ## Choosing a Config
 
+A preset is chosen when the config is generated, with `pipelock generate config
+--preset <name> -o pipelock.yaml`, and the file it writes is what `--config`
+takes. Run `pipelock presets` to list them.
+
 | Preset | Action | Best For |
 |--------|--------|----------|
-| `balanced.yaml` | warn | Getting started, tuning phase |
-| `claude-code.yaml` | block | Unattended Codex sessions (works for Codex too) |
-| `strict.yaml` | block | High-security repos, sensitive code |
-| `hostile-model.yaml` | block | If using uncensored models via Codex |
+| `balanced` | warn | Getting started, tuning phase |
+| `claude-code` | block | Unattended Codex sessions (works for Codex too) |
+| `strict` | block | High-security repos, sensitive code |
+| `hostile-model` | block | If using uncensored models via Codex |
 
-Start with `balanced.yaml` to see what gets flagged. Switch to
-`claude-code.yaml` or `strict.yaml` once you've verified no false positives.
+Start with `balanced` to see what gets flagged. Switch to
+`claude-code` or `strict` once you've verified no false positives.
 
 ## Evidence and Audit Trail
 
@@ -216,10 +224,10 @@ Verify the command works without Codex first:
 
 ```bash
 # Test the MCP server directly
-pipelock mcp proxy --config configs/balanced.yaml -- npx -y @modelcontextprotocol/server-filesystem /tmp
+pipelock mcp proxy --config pipelock.yaml -- npx -y @modelcontextprotocol/server-filesystem /tmp
 
 # Then add to Codex
-codex mcp add test-fs -- pipelock mcp proxy --config configs/balanced.yaml -- npx -y @modelcontextprotocol/server-filesystem /tmp
+codex mcp add test-fs -- pipelock mcp proxy --config pipelock.yaml -- npx -y @modelcontextprotocol/server-filesystem /tmp
 ```
 
 ### Environment variables not passing through

@@ -18,7 +18,7 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
-use crate::provenance::{ProcessingBudget, Recipe as TransformRecipe, PROFILE_DIGEST};
+use crate::provenance::{is_known_profile_digest, ProcessingBudget, Recipe as TransformRecipe};
 use crate::util::{reject_duplicate_keys, sha256_hex, Result, VerifierError};
 
 const FIXTURE_FORMAT: &str = "pipelock-evidence-provenance-verification-fixture/v1";
@@ -609,8 +609,9 @@ fn parse_proof(
         &["version", "transform_profile_digest", "sources", "producer"],
         "proof",
     )?;
+    let proof_profile = string(proof, "transform_profile_digest", "proof")?.to_string();
     if string(proof, "version", "proof")? != PROOF_VERSION
-        || string(proof, "transform_profile_digest", "proof")? != PROFILE_DIGEST
+        || !is_known_profile_digest(&proof_profile)
     {
         return Err("proof: unsupported version or profile".into());
     }
@@ -662,6 +663,9 @@ fn parse_proof(
         }
         prior_source = Some(ordinal);
         let recipe = parse_recipe(required(source, "recipe", "proof source")?)?;
+        if recipe.profile != proof_profile {
+            return Err("proof source: recipe profile differs from proof".into());
+        }
         let commitment = string(source, "view_commitment", "proof source")?.to_string();
         valid_digest(&commitment, "hmac-sha256:")?;
         let mut matches = Vec::new();
@@ -731,7 +735,7 @@ fn parse_recipe(value: &Value) -> std::result::Result<Recipe, String> {
     if profile.is_empty() {
         return Err("missing transform profile digest".into());
     }
-    if profile != PROFILE_DIGEST {
+    if !is_known_profile_digest(&profile) {
         return Err("recipe: unknown transform profile".into());
     }
     let operation_values = required(recipe, "operations", "recipe")?;
@@ -895,6 +899,7 @@ fn kind_byte(kind: &str) -> std::result::Result<u8, String> {
         "hostname_dot_remove" => Ok(25),
         "encoded_run" => Ok(26),
         "canary_canonicalize" => Ok(27),
+        "ascii_alphanumeric_strip" => Ok(28),
         _ => Err("unknown operation".into()),
     }
 }
@@ -1106,6 +1111,7 @@ fn valid_digest(value: &str, prefix: &str) -> std::result::Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provenance::PROFILE_DIGEST;
     use ed25519_dalek::{Signer, SigningKey};
     use serde::Deserialize;
     use serde_json::json;
@@ -1211,7 +1217,7 @@ mod tests {
             vectors,
             ..
         } = corpus;
-        assert_eq!(vectors.len(), 63, "corpus vector count changed");
+        assert_eq!(vectors.len(), 74, "corpus vector count changed");
         for vector in vectors {
             let input = STANDARD.decode(&vector.input_b64).unwrap();
             let result = String::from_utf8(input)

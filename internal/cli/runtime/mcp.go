@@ -259,6 +259,17 @@ func handleProxyError(err error, logW io.Writer, sentryClient *plsentry.Client) 
 	return err
 }
 
+func applyMCPA2AOpts(opts *mcp.MCPProxyOpts, cfg *config.Config, baseline *mcp.CardBaseline, cardURL string) {
+	if cfg != nil {
+		a2a := cfg.A2AScanning
+		opts.A2ACfg = &a2a
+	}
+	opts.CardBaseline = baseline
+	if cardURL != "" {
+		opts.A2ACardURL = cardURL
+	}
+}
+
 func applyMCPResponseSuppressOpts(opts *mcp.MCPProxyOpts, cfg *config.Config, serverName string) {
 	opts.ServerName = serverName
 	trust := config.ResponseTrustUntrusted
@@ -271,7 +282,7 @@ func applyMCPResponseSuppressOpts(opts *mcp.MCPProxyOpts, cfg *config.Config, se
 		taintTrusted = cfg.TaintTrustsMCPServer(serverName)
 	}
 	opts.ResponseTrustClass = trust
-	opts.ResponseActionOverride = config.MCPResponseActionForTrust(trust)
+	opts.ResponseActionOverride = cfg.MCPResponseActionForServer(serverName)
 	opts.TaintTrustedSource = taintTrusted
 }
 
@@ -323,7 +334,10 @@ func buildDeferManager(cfg *config.Config, warningWriter io.Writer) *deferred.Ma
 		MaxPendingBytes:      cfg.Defer.MaxPendingBytes,
 		MaxCascadeDepth:      cfg.Defer.MaxCascadeDepth,
 		JournalPath:          deferJournalPath(cfg),
-		Warningf:             warningf,
+		JournalWriteGuard: func(write func() error) error {
+			return recorder.WithEvidenceWriterCeremonyLock(cfg.FlightRecorder.Dir, write)
+		},
+		Warningf: warningf,
 	})
 }
 
@@ -638,6 +652,7 @@ each line that can be read produces a verdict.
 Examples:
   mcp-server | pipelock mcp scan
   pipelock mcp scan --json --config pipelock.yaml < responses.jsonl`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := cliutil.LoadConfigOrDefault(configFile)
 			if err != nil {
@@ -1301,6 +1316,7 @@ Key-free evidence capture:
 			if policyCfg != nil {
 				policyAction = policyCfg.Action
 			}
+			a2aCardBaseline := mcp.NewCardBaseline(1000)
 			deferManager := buildDeferManager(cfg, cmd.ErrOrStderr())
 			if err := recoverDeferredActions(deferManager, deferJournalPath(cfg), receiptEmitter, v2ReceiptEmitter, captureConfigHash, cmd.ErrOrStderr()); err != nil {
 				return err
@@ -1379,6 +1395,7 @@ Key-free evidence capture:
 							return readMCPListenerTokenFile(listenerAuthTokenFile)
 						}
 					}
+					applyMCPA2AOpts(&listenerOpts, cfg, a2aCardBaseline, upstreamURL)
 					applyMCPResponseSuppressOpts(&listenerOpts, cfg, serverName)
 					listenerOpts = mcpReceiptParityOpts(listenerOpts, receiptEmitter, v2ReceiptEmitter, captureConfigHash, cfg.FlightRecorder.RequireReceipts)
 					respAction, respTrust, respServer := mcpResponseLogFields(listenerOpts)
@@ -1429,6 +1446,7 @@ Key-free evidence capture:
 						DialContext:            upstreamDialContext,
 					}
 					applyMCPDoWOpts(&wsOpts, dowWiring, false)
+					applyMCPA2AOpts(&wsOpts, cfg, a2aCardBaseline, upstreamURL)
 					applyMCPResponseSuppressOpts(&wsOpts, cfg, serverName)
 					wsOpts = mcpReceiptParityOpts(wsOpts, receiptEmitter, v2ReceiptEmitter, captureConfigHash, cfg.FlightRecorder.RequireReceipts)
 					respAction, respTrust, respServer := mcpResponseLogFields(wsOpts)
@@ -1483,6 +1501,7 @@ Key-free evidence capture:
 					DialContext:            upstreamDialContext,
 				}
 				applyMCPDoWOpts(&httpOpts, dowWiring, false)
+				applyMCPA2AOpts(&httpOpts, cfg, a2aCardBaseline, upstreamURL)
 				applyMCPResponseSuppressOpts(&httpOpts, cfg, serverName)
 				httpOpts = mcpReceiptParityOpts(httpOpts, receiptEmitter, v2ReceiptEmitter, captureConfigHash, cfg.FlightRecorder.RequireReceipts)
 				respAction, respTrust, respServer := mcpResponseLogFields(httpOpts)
@@ -1665,6 +1684,7 @@ Key-free evidence capture:
 					DeferManager:           deferManager,
 				}
 				applyMCPDoWOpts(&proxyOpts, dowWiring, false)
+				applyMCPA2AOpts(&proxyOpts, cfg, a2aCardBaseline, "")
 				applyMCPResponseSuppressOpts(&proxyOpts, cfg, serverName)
 				proxyOpts = mcpReceiptParityOpts(proxyOpts, receiptEmitter, v2ReceiptEmitter, captureConfigHash, cfg.FlightRecorder.RequireReceipts)
 				respAction, respTrust, respServer := mcpResponseLogFields(proxyOpts)
@@ -1705,6 +1725,7 @@ Key-free evidence capture:
 			// to prevent early writes from being missed.
 			var lin filesentry.Lineage
 			var onChildReady func()
+			stopFileSentry := func() error { return nil }
 			if cfg.FileSentry.Enabled {
 				lin = filesentry.NewLineage()
 				// Error handler for non-fatal runtime errors (e.g. failing to watch new dirs).
@@ -1745,24 +1766,40 @@ Key-free evidence capture:
 						OnFinding: findingHook,
 						Cancel:    cancel,
 					})
-					// Single defer: close watcher (flushes + closes channel),
-					// then wait for consumer to finish processing.
-					defer func() {
-						_ = watcher.Close()
-						waitConsumer()
-					}()
+					var failure fileSentryRuntimeFailure
+					var watcherWG sync.WaitGroup
+					var watcherStartOnce sync.Once
+					var stopOnce sync.Once
+					var stopErr error
+					stopFileSentry = func() error {
+						stopOnce.Do(func() {
+							_ = watcher.Close()
+							watcherWG.Wait()
+							waitConsumer()
+							if err := failure.get(); err != nil {
+								stopErr = fmt.Errorf("file sentry runtime failed: %w", err)
+							}
+						})
+						return stopErr
+					}
+					defer func() { _ = stopFileSentry() }()
 					reportFileSentryCoverage(logW, len(cfg.FileSentry.WatchPaths), cfg.FileSentry.Action, watcher.DegradedPathCount())
 
 					// onChildReady: called by RunProxy after cmd.Start() + TrackPID.
 					// Starts the file sentry event loop AFTER the child PID is registered,
 					// so attribution is ready before classifying any writes.
 					onChildReady = func() {
-						go func() {
-							if startErr := watcher.Start(ctx); startErr != nil {
-								_, _ = fmt.Fprintf(logW, "pipelock: file sentry fatal: %v — cancelling proxy\n", startErr)
-								cancel()
-							}
-						}()
+						watcherStartOnce.Do(func() {
+							watcherWG.Add(1)
+							go func() {
+								defer watcherWG.Done()
+								if startErr := watcher.Start(ctx); startErr != nil {
+									_, _ = fmt.Fprintf(logW, "pipelock: file sentry fatal: %v — cancelling proxy\n", startErr)
+									failure.set(startErr)
+									cancel()
+								}
+							}()
+						})
 					}
 				} // watcher != nil
 			}
@@ -1795,6 +1832,7 @@ Key-free evidence capture:
 				DeferManager:           deferManager,
 			}
 			applyMCPDoWOpts(&proxyOpts, dowWiring, false)
+			applyMCPA2AOpts(&proxyOpts, cfg, a2aCardBaseline, "")
 			applyMCPResponseSuppressOpts(&proxyOpts, cfg, serverName)
 			proxyOpts = mcpReceiptParityOpts(proxyOpts, receiptEmitter, v2ReceiptEmitter, captureConfigHash, cfg.FlightRecorder.RequireReceipts)
 			// The unsandboxed path has no UID/GID map setup. Harden before
@@ -1806,10 +1844,23 @@ Key-free evidence capture:
 			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: proxying MCP server %v (response=%s, trust=%s, server=%s, input=%s, tools=%s, policy=%s)\n",
 				serverCmd, respAction, respTrust, respServer, inputCfg.Action, toolAction, policyAction)
 			if err := mcp.RunProxy(ctx, cmd.InOrStdin(), cmd.OutOrStdout(), logW, serverCmd, proxyOpts, extraEnv...); err != nil {
+				if fileSentryErr := stopFileSentry(); fileSentryErr != nil {
+					return fileSentryErr
+				}
 				if heartbeatErr := requiredHeartbeatErr(); heartbeatErr != nil {
 					return heartbeatErr
 				}
+				// signal.NotifyContext terminates the wrapped child during an
+				// ordinary parent cancellation. That resulting process status is
+				// teardown noise, not a proxy failure. File-sentry and required
+				// heartbeat failures are checked above so they still fail closed.
+				if ctx.Err() != nil {
+					return nil
+				}
 				return handleProxyError(err, logW, sentryClient)
+			}
+			if fileSentryErr := stopFileSentry(); fileSentryErr != nil {
+				return fileSentryErr
 			}
 			if heartbeatErr := requiredHeartbeatErr(); heartbeatErr != nil {
 				return heartbeatErr

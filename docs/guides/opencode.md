@@ -44,7 +44,8 @@ pipelock opencode install
 For shell-executed HTTP (curl, wget, fetch), run pipelock as a forward proxy:
 
 ```bash
-pipelock run --config configs/balanced.yaml &
+pipelock generate config --preset balanced > pipelock.yaml
+pipelock run --config pipelock.yaml &
 export HTTPS_PROXY=http://127.0.0.1:8888
 export HTTP_PROXY=http://127.0.0.1:8888
 export NO_PROXY=127.0.0.1,localhost
@@ -56,12 +57,12 @@ This adds DLP / SSRF / response-injection scanning to outbound HTTP requests fro
 
 | Preset | Action | Best for |
 |---|---|---|
-| `balanced.yaml` | warn | Getting started, tuning phase |
-| `claude-code.yaml` | block | Unattended OpenCode sessions on production code |
-| `strict.yaml` | block | High-security repos |
-| `hostile-model.yaml` | block | If you're running an uncensored model |
+| `balanced` | warn | Getting started, tuning phase |
+| `claude-code` | block | Unattended OpenCode sessions on production code |
+| `strict` | block | High-security repos |
+| `hostile-model` | block | If you're running an uncensored model |
 
-Start in `balanced.yaml` to surface false positives in audit mode. Promote to a blocking preset once a workload is clean.
+Start in `balanced` to surface false positives in audit mode. Promote to a blocking preset once a workload is clean.
 
 ## Containment for Local Multi-User Hosts
 

@@ -23,7 +23,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .number import IJSONNumber, StrictParseError, parse_json_strict
-from .provenance import PROFILE_DIGEST
+from .provenance import PROFILE_DIGEST, ProvenanceError as TransformProvenanceError, profile_version
 from .provenance import Recipe as TransformRecipe
 
 FIXTURE_FORMAT = "pipelock-evidence-provenance-verification-fixture/v1"
@@ -75,6 +75,7 @@ _OP_BYTES = {
     "hostname_dot_remove": 25,
     "encoded_run": 26,
     "canary_canonicalize": 27,
+    "ascii_alphanumeric_strip": 28,
 }
 _COMPONENT_BYTES = {
     "": 0,
@@ -249,8 +250,10 @@ def _recipe_bytes(recipe: dict[str, Any]) -> bytes:
     profile = _require_str(recipe["transform_profile_digest"], "recipe profile")
     if profile == "":
         raise ProvenanceError("proof_structure", "missing transform profile digest")
-    if profile != PROFILE_DIGEST:
-        raise ProvenanceError("proof_structure", "unknown transform profile")
+    try:
+        profile_version(profile)
+    except ProvenanceError as exc:
+        raise ProvenanceError("proof_structure", "unknown transform profile") from exc
     operations = recipe["operations"]
     if not isinstance(operations, list):
         raise ProvenanceError("proof_structure", "recipe operations must be an array")
@@ -462,10 +465,11 @@ def _verify_entry(
         proof = _exact_dict(signed_object["proof"], _PROOF_KEYS, "proof")
         if _require_str(proof["version"], "proof version") != PROOF_VERSION:
             raise ProvenanceError("proof_structure", "unsupported proof version")
-        if (
-            _require_str(proof["transform_profile_digest"], "proof profile")
-            != PROFILE_DIGEST
-        ):
+        try:
+            profile_version(
+                _require_str(proof["transform_profile_digest"], "proof profile")
+            )
+        except TransformProvenanceError:
             raise ProvenanceError("proof_structure", "unknown proof profile")
         producer = _fields(proof["producer"], set(), _PRODUCER_KEYS, "producer")
         source_list = proof["sources"]

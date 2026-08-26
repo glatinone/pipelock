@@ -64,6 +64,7 @@ If mcp.json already exists, servers are wrapped in place. Already-wrapped
 servers are skipped (idempotent). A .bak backup is created before modification.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Args:          cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runJetbrainsInstall(cmd, global, project, dryRun, configFile, sandbox, workspace, quiet)
 		},
@@ -95,6 +96,7 @@ pipelock install. Original server configurations are restored from the
 _pipelock metadata field. Non-wrapped servers are left unchanged.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Args:          cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runJetbrainsRemove(cmd, global, project, dryRun)
 		},
@@ -157,10 +159,11 @@ func runJetbrainsInstall(cmd *cobra.Command, global, project, dryRun bool, confi
 	wrapped := 0
 	skipped := 0
 	for name, server := range cfg.Servers {
-		if isWrapped(server) {
+		if isWrappedBySelf(server) {
 			skipped++
 			continue
 		}
+		warnForeignWrapper(cmd.ErrOrStderr(), name, server)
 
 		newServer, meta, err := wrapMCPServer(server, exe, resolvedConfig.Path, sandbox, workspace)
 		if err != nil {
@@ -236,7 +239,8 @@ func runJetbrainsRemove(cmd *cobra.Command, global, project, dryRun bool) error 
 
 	unwrapped := 0
 	for name, server := range cfg.Servers {
-		if !isWrapped(server) {
+		if !isRestorableWrapper(server) {
+			warnUnrestorableWrapper(cmd.ErrOrStderr(), name, server)
 			continue
 		}
 

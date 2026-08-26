@@ -12,12 +12,18 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/luckyPipewrench/pipelock/internal/mcpwrap"
 	"github.com/spf13/cobra"
 )
 
 func generateMcporterCmd() *cobra.Command {
+	return generateMcporterCmdWithExecutable(os.Executable)
+}
+
+func generateMcporterCmdWithExecutable(executable func() (string, error)) *cobra.Command {
 	var inputFile, outputFile, pipelockBin, configPath string
 	var inPlace, backup bool
+	defaultPipelockBin, executableErr := executable()
 
 	cmd := &cobra.Command{
 		Use:   "mcporter",
@@ -38,7 +44,11 @@ Examples:
   pipelock generate mcporter -i servers.json
   pipelock generate mcporter -i servers.json -o wrapped.json
   pipelock generate mcporter -i servers.json --in-place --backup`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if executableErr != nil && !cmd.Flags().Changed("pipelock-bin") {
+				return fmt.Errorf("resolving current pipelock executable: %w", executableErr)
+			}
 			if inPlace && outputFile != "" {
 				return fmt.Errorf("--in-place and --output are mutually exclusive")
 			}
@@ -117,7 +127,7 @@ Examples:
 	cmd.Flags().StringVarP(&outputFile, "output", "o", "", "output file path (default: stdout)")
 	cmd.Flags().BoolVar(&inPlace, "in-place", false, "modify input file in-place (atomic write)")
 	cmd.Flags().BoolVar(&backup, "backup", false, "create .bak before in-place modification")
-	cmd.Flags().StringVar(&pipelockBin, "pipelock-bin", "pipelock", "path to pipelock binary in output")
+	cmd.Flags().StringVar(&pipelockBin, "pipelock-bin", defaultPipelockBin, "path to pipelock binary in output")
 	cmd.Flags().StringVarP(&configPath, "config", "c", "pipelock.yaml", "path to pipelock config in output")
 	return cmd
 }
@@ -147,7 +157,7 @@ func wrapServerEntry(raw json.RawMessage, pipelockBin, configPath string) (wrapp
 			if argsErr != nil {
 				return wrappedEntry{}, fmt.Errorf("url server args: %w", argsErr)
 			}
-			if isAlreadyWrapped(cmdStr, args) {
+			if isAlreadyWrapped(cmdStr, args, pipelockBin) {
 				return wrappedEntry{value: entry, skipped: true}, nil
 			}
 		}
@@ -173,7 +183,7 @@ func wrapServerEntry(raw json.RawMessage, pipelockBin, configPath string) (wrapp
 		return wrappedEntry{}, fmt.Errorf("args: %w", argsErr)
 	}
 
-	if isAlreadyWrapped(cmdStr, args) {
+	if isAlreadyWrapped(cmdStr, args, pipelockBin) {
 		return wrappedEntry{value: entry, skipped: true}, nil
 	}
 
@@ -265,30 +275,13 @@ func copyExtraFields(dst, src map[string]interface{}, managed ...string) {
 	}
 }
 
-const (
-	mcporterBinaryName = "pipelock"
-	mcporterSubMCP     = "mcp"
-	mcporterSubProxy   = "proxy"
-)
+func currentPipelockExecutable() string {
+	self, _ := os.Executable()
+	return self
+}
 
-func isAlreadyWrapped(command string, args []string) bool {
-	if filepath.Base(command) != mcporterBinaryName {
-		return false
-	}
-	foundMCP := false
-	for _, a := range args {
-		if a == "--" {
-			break
-		}
-		if !foundMCP && a == mcporterSubMCP {
-			foundMCP = true
-			continue
-		}
-		if foundMCP && a == mcporterSubProxy {
-			return true
-		}
-	}
-	return false
+func isAlreadyWrapped(command string, args []string, pipelockBin string) bool {
+	return mcpwrap.ClassifyInvocationAgainst(command, args, pipelockBin) == mcpwrap.WrapperSelf
 }
 
 func toStringSlice(raw []interface{}) ([]string, error) {

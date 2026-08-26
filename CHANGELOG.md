@@ -7,13 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- Recorder readers accept the v3 outer-chain namespace fields
-  `chain_kind` and `writer_instance_id`. The recorder continues to emit v2
-  entries during the compatibility window.
-
-## [3.4.0] - 2026-08-18
+## [3.4.0] - 2026-08-20
 
 ### Breaking Changes / Upgrade Notes
 
@@ -24,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fires from `on_elevated`, `on_high` and `on_critical`; remove the three old keys and
   set those instead. A silently inert knob is worse than a rejected one, which is why
   this refuses rather than warning.
+- **A reasoning trust class can no longer weaken a stricter response action.** An MCP
+  server marked `trust: reasoning` maps to `warn`, but Pipelock now applies whichever of
+  that mapping and `response_scanning.action` is stricter. An operator running `block`,
+  `ask` or `strip` with a reasoning server configured was getting warn-and-forward for
+  that server; those responses now take the section action. A trust class can tighten the
+  enclosing action and can no longer relax it. If you relied on the old behaviour, set
+  `response_scanning.action: warn` explicitly rather than expecting the server entry to
+  override a stricter setting.
 - **`pipelock git scan-diff` has a three-value exit contract.** `0` means the diff was
   scanned and is clean, `1` means secrets were found, and `2` means no verified result
   was produced, covering unreadable or unparseable input and configuration, encoding or
@@ -37,6 +39,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Release publication now requires a verified release manifest.** Tagging halts before
   publication until `release.json.sig` is signed and uploaded, so a release cannot leave
   draft with an unverified manifest.
+- **Reverse-proxy request bodies declaring an image, audio or video type are now
+  scanned.** They were skipped, so a secret placed after a genuine media signature left
+  the network unexamined. Media is now subject to the same request-body policy as
+  everything else, and a body above `request_body_scanning.max_body_bytes` returns 413
+  rather than streaming through unscanned. An operator who legitimately posts uploads
+  larger than the 5 MiB default through the reverse proxy must raise that cap or route
+  those uploads around it. This does not detect a secret embedded inside a valid image.
+- **Evidence provenance transforms move to a second profile.** Two registered operations
+  changed the bytes they strip, so the profile describing them was superseded rather than
+  edited: `evidence-provenance-transform-v1` keeps its bytes, its digest and its original
+  semantics, and a v2 profile describes the current behaviour. A receipt selects its
+  profile by exact digest and an unknown digest is rejected before any operation runs,
+  never falling back. A verifier that predates v2 will refuse a v2 proof rather than
+  replay it incorrectly, so publish verifier support before relying on v2 receipts.
 
 ### Added
 
@@ -53,11 +69,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The Helm chart publishes as an OCI artifact.
 - An explicit applicability vocabulary for verification status, separating a check that
   cannot apply from one that applies and has no measurement.
+- `reverse_proxy.max_inflight_scan_bytes`, a per-instance budget for request bodies held
+  while being inspected. A request that cannot reserve capacity is refused before its body
+  is read, so scanning media cannot be turned into a way to exhaust memory. It defaults to
+  64 MiB, which admits twelve concurrent uploads at the default body cap.
+- Recorder readers accept the v3 outer-chain namespace fields
+  `chain_kind` and `writer_instance_id`. The recorder continues to emit v2
+  entries during the compatibility window.
 
 ### Changed
 
 - Human-readable CLI results go to stdout and diagnostics to stderr, so a caller can pipe
-  one without the other.
+  one without the other. `pipelock version > file` and `pipelock generate docker-compose >
+  docker-compose.yml` produce their content rather than an empty file.
+- A command group rejects a subcommand it does not have instead of printing help and
+  reporting success. A setup step whose subcommand name is wrong now fails, where it
+  previously looked like it had run.
 - `pipelock explain` discloses every enabled control an allowed verdict did not evaluate.
   It does not fetch the URL or resolve DNS, so response scanning, request body scanning
   and the SSRF layer can still block a request the explanation allowed.
@@ -85,6 +112,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interchangeable with the signed one.
 - Evidence provenance commitments are unambiguous, and the provenance profile describes
   the scanner transforms that actually run.
+- Encoded credentials split by an unlisted character are matched again. Normalization
+  named the characters it removed, so a value broken up by anything absent from that list
+  either survived unchanged or aborted normalization entirely, and reached DLP in a form
+  it could not match. Each transform now keeps only the bytes valid for its alphabet and
+  treats everything else as noise, which closes the rule over the alphabet rather than
+  over a list. Known environment and file secrets written as hex are matched through the
+  same set, where a separate smaller list had been maintained alongside it.
+- A credential spread across more than four query values is assembled before matching.
+- The kill switch denies proxied requests whatever destination path they carry. Its
+  endpoint exemptions keep Pipelock's own operational endpoints answering while traffic is
+  denied, but they compared the request path without first establishing that the request
+  was addressed to Pipelock, and a forward-proxy request carries the destination's path.
+  Exemptions now sit behind a single check consulted ahead of all of them, so one added
+  later inherits it. The IP allowlist still applies to proxied traffic, because it keys on
+  the client address rather than a path the client chooses. Upgrade if you treat the kill
+  switch as an absolute stop.
+- URL DLP joins the path and the query when matching credential patterns. Targets were
+  built from each side of the separator with nothing joining them, so a credential divided
+  across that boundary matched no target: neither half satisfies a pattern alone, and the
+  whole-URL view cannot bridge the separator because it falls outside every credential
+  pattern's character class. The seam is now its own target, in the shared helper both the
+  configured scanner and the core floor use, so the core copy cannot shadow the fix. The
+  path side is decoded to a fixpoint first, because `url.Parse` decodes a path once while
+  the query values were already decoded repeatedly, and a multi-escaped prefix survived
+  that asymmetry.
+- The provider-opaque request-body carve-out requires the body to measure as ciphertext.
+  A long opaque field previously qualified on length alone, so padded content skipped
+  inspection.
+- The Go, Rust and TypeScript provenance implementations agree with the profile they
+  claim to follow, and with the Python one, which was the only implementation still
+  matching the published description. The shared conformance corpus gains vectors that
+  distinguish the two rule sets; its previous vectors used only characters both rules
+  strip, so it could not have detected the disagreement.
 - Recorder evidence is preserved under concurrent writers, and anchor bundle and marker
   state are fsynced before success is reported.
 - Metrics stop reporting a self-awarded evidence assurance level and cap the current
@@ -103,6 +163,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A second release no longer overwrites the published Helm chart.
 - The sandbox preserves capacity on busy hosts and treats its network lifecycle as a
   fail-closed required service.
+- `pipelock quickstart` prints a walkthrough a reader can run. It creates the config its
+  later steps use, instead of naming one that ships only in a source checkout, and writes
+  each step in the syntax of the platform it is printed on.
+- Integration guides and the README no longer show commands that cannot run: a flag that
+  does not exist on `run` or `mcp proxy`, config paths present only in a source checkout,
+  and an evidence-viewer invocation pointed at a directory it cannot read.
 
 ## [3.3.0] - 2026-07-30
 

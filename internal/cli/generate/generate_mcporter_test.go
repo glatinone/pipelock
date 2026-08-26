@@ -6,6 +6,7 @@ package generate
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,7 +53,7 @@ func TestGenerateMcporter_BasicWrap(t *testing.T) {
 	servers := result["mcpServers"].(map[string]interface{})
 	fs := servers["filesystem"].(map[string]interface{})
 
-	if fs["command"] != mcporterBinaryName {
+	if fs["command"] != currentPipelockExecutable() {
 		t.Fatalf("command should be pipelock, got %v", fs["command"])
 	}
 
@@ -77,14 +78,14 @@ func TestGenerateMcporter_BasicWrap(t *testing.T) {
 }
 
 func TestGenerateMcporter_AlreadyWrapped(t *testing.T) {
-	input := `{
+	input := fmt.Sprintf(`{
 		"mcpServers": {
 			"filesystem": {
-				"command": "pipelock",
+				"command": %q,
 				"args": ["mcp", "proxy", "--", "npx", "server"]
 			}
 		}
-	}`
+	}`, currentPipelockExecutable())
 
 	var buf bytes.Buffer
 	cmd := testRootCmd()
@@ -108,13 +109,111 @@ func TestGenerateMcporter_AlreadyWrapped(t *testing.T) {
 
 	servers := result["mcpServers"].(map[string]interface{})
 	fs := servers["filesystem"].(map[string]interface{})
-	if fs["command"] != mcporterBinaryName {
+	if fs["command"] != currentPipelockExecutable() {
 		t.Fatal("already-wrapped server should remain unchanged")
 	}
 	// Verify args are unchanged (not double-wrapped).
 	args := fs["args"].([]interface{})
 	if len(args) != 5 || args[0] != "mcp" || args[1] != "proxy" {
 		t.Fatalf("args should be unchanged, got %v", args)
+	}
+}
+
+func TestGenerateMcporter_ExplicitTargetRerunIsIdempotent(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "pipelock")
+	if err := os.WriteFile(target, []byte("target binary fixture"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	input := fmt.Sprintf(`{"mcpServers":{"server":{"command":%q,"args":["mcp","proxy","--","node","server.js"]}}}`, target)
+	tmpFile := filepath.Join(t.TempDir(), "mcporter.json")
+	if err := os.WriteFile(tmpFile, []byte(input), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out, stderr bytes.Buffer
+	cmd := testRootCmd()
+	cmd.SetOut(&out)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"generate", "mcporter", "-i", tmpFile, "--pipelock-bin", target})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "already wrapped") {
+		t.Fatalf("explicit target rerun was not skipped: %q", stderr.String())
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("parse output: %v", err)
+	}
+	server := result["mcpServers"].(map[string]interface{})["server"].(map[string]interface{})
+	if server["command"] != target || len(server["args"].([]interface{})) != 5 {
+		t.Fatalf("explicit target rerun changed wrapper: %#v", server)
+	}
+}
+
+func TestGenerateMcporter_ForeignPipelockNameIsWrapped(t *testing.T) {
+	input := `{"mcpServers":{
+		"forged":{"command":"/tmp/attacker/pipelock","args":["mcp","proxy","--","server"]},
+		"forged-http":{"url":"https://api.vendor.example/mcp","command":"/tmp/attacker/pipelock","args":["mcp","proxy"]},
+		"forged-ws":{"url":"wss://api.vendor.example/mcp","command":"/tmp/attacker/pipelock","args":["mcp","proxy"]}
+	}}`
+	var out, stderr bytes.Buffer
+	cmd := testRootCmd()
+	cmd.SetOut(&out)
+	cmd.SetErr(&stderr)
+	tmpFile := filepath.Join(t.TempDir(), "mcporter.json")
+	if err := os.WriteFile(tmpFile, []byte(input), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd.SetArgs([]string{"generate", "mcporter", "-i", tmpFile})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("parse output: %v", err)
+	}
+	server := result["mcpServers"].(map[string]interface{})["forged"].(map[string]interface{})
+	if server["command"] != currentPipelockExecutable() {
+		t.Fatalf("foreign command was trusted instead of wrapped: %#v", server)
+	}
+	args := server["args"].([]interface{})
+	if len(args) < 2 || args[0] != "mcp" || args[1] != "proxy" {
+		t.Fatalf("new wrapper args missing strict prefix: %v", args)
+	}
+	if strings.Contains(stderr.String(), "already wrapped") {
+		t.Fatalf("foreign command was reported protected: %q", stderr.String())
+	}
+	for _, name := range []string{"forged-http", "forged-ws"} {
+		remote := result["mcpServers"].(map[string]interface{})[name].(map[string]interface{})
+		if remote["command"] != currentPipelockExecutable() {
+			t.Fatalf("%s foreign command was trusted instead of wrapped: %#v", name, remote)
+		}
+		remoteArgs := remote["args"].([]interface{})
+		if len(remoteArgs) < 2 || remoteArgs[0] != "mcp" || remoteArgs[1] != "proxy" {
+			t.Fatalf("%s wrapper args missing strict prefix: %v", name, remoteArgs)
+		}
+	}
+}
+
+func TestGenerateMcporter_ExecutableResolutionFailure(t *testing.T) {
+	input := filepath.Join(t.TempDir(), "mcporter.json")
+	if err := os.WriteFile(input, []byte(testMCPInput), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolver := func() (string, error) { return "/untrusted/partial/path", fmt.Errorf("unsupported") }
+
+	cmd := generateMcporterCmdWithExecutable(resolver)
+	cmd.SetArgs([]string{"--input", input})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "resolving current pipelock executable") {
+		t.Fatalf("default executable resolution error = %v", err)
+	}
+
+	cmd = generateMcporterCmdWithExecutable(resolver)
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetArgs([]string{"--input", input, "--pipelock-bin", "/opt/pipelock"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("explicit executable should bypass current-path resolution: %v", err)
 	}
 }
 
@@ -149,7 +248,7 @@ func TestGenerateMcporter_HTTPUpstream(t *testing.T) {
 
 	servers := result["mcpServers"].(map[string]interface{})
 	remote := servers["remote"].(map[string]interface{})
-	if remote["command"] != mcporterBinaryName {
+	if remote["command"] != currentPipelockExecutable() {
 		t.Fatal("expected pipelock wrapper")
 	}
 	args := remote["args"].([]interface{})
@@ -195,7 +294,7 @@ func TestGenerateMcporter_WSUpstream(t *testing.T) {
 
 	servers := result["mcpServers"].(map[string]interface{})
 	ws := servers["ws-server"].(map[string]interface{})
-	if ws["command"] != mcporterBinaryName {
+	if ws["command"] != currentPipelockExecutable() {
 		t.Fatal("expected pipelock wrapper")
 	}
 	args := ws["args"].([]interface{})
@@ -315,7 +414,7 @@ func TestGenerateMcporter_InPlace(t *testing.T) {
 
 	servers := result["mcpServers"].(map[string]interface{})
 	test := servers["test"].(map[string]interface{})
-	if test["command"] != mcporterBinaryName {
+	if test["command"] != currentPipelockExecutable() {
 		t.Fatal("in-place write should have wrapped the server")
 	}
 }
@@ -391,7 +490,7 @@ func TestGenerateMcporter_CustomBinAndConfig(t *testing.T) {
 }
 
 func TestGenerateMcporter_MultipleServers(t *testing.T) {
-	input := `{
+	input := fmt.Sprintf(`{
 		"mcpServers": {
 			"stdio-server": {
 				"command": "node",
@@ -401,11 +500,11 @@ func TestGenerateMcporter_MultipleServers(t *testing.T) {
 				"url": "http://localhost:3000/mcp"
 			},
 			"wrapped": {
-				"command": "pipelock",
+				"command": %q,
 				"args": ["mcp", "proxy", "--", "python", "server.py"]
 			}
 		}
-	}`
+	}`, currentPipelockExecutable())
 
 	var buf, stderr bytes.Buffer
 	cmd := testRootCmd()
@@ -431,19 +530,19 @@ func TestGenerateMcporter_MultipleServers(t *testing.T) {
 
 	// stdio-server should be wrapped.
 	stdio := servers["stdio-server"].(map[string]interface{})
-	if stdio["command"] != mcporterBinaryName {
+	if stdio["command"] != currentPipelockExecutable() {
 		t.Fatal("stdio-server should be wrapped")
 	}
 
 	// http-server should be wrapped with --upstream.
 	http := servers["http-server"].(map[string]interface{})
-	if http["command"] != mcporterBinaryName {
+	if http["command"] != currentPipelockExecutable() {
 		t.Fatal("http-server should be wrapped")
 	}
 
 	// wrapped should remain unchanged.
 	w := servers["wrapped"].(map[string]interface{})
-	if w["command"] != mcporterBinaryName {
+	if w["command"] != currentPipelockExecutable() {
 		t.Fatal("wrapped should remain pipelock")
 	}
 	wArgs := w["args"].([]interface{})
@@ -684,7 +783,7 @@ func TestGenerateMcporter_OutputFile(t *testing.T) {
 	}
 	servers := result["mcpServers"].(map[string]interface{})
 	test := servers["test"].(map[string]interface{})
-	if test["command"] != mcporterBinaryName {
+	if test["command"] != currentPipelockExecutable() {
 		t.Fatal("output file should contain wrapped server")
 	}
 }
@@ -786,15 +885,15 @@ func TestGenerateMcporter_OutputFileError(t *testing.T) {
 
 func TestGenerateMcporter_URLEntryAlreadyWrapped(t *testing.T) {
 	// URL entry that also has command/args indicating pipelock wrapping.
-	input := `{
+	input := fmt.Sprintf(`{
 		"mcpServers": {
 			"gateway": {
 				"url": "ws://localhost:3000/mcp",
-				"command": "pipelock",
+				"command": %q,
 				"args": ["mcp", "proxy", "--upstream", "ws://localhost:3000/mcp"]
 			}
 		}
-	}`
+	}`, currentPipelockExecutable())
 
 	var buf bytes.Buffer
 	cmd := testRootCmd()
@@ -819,14 +918,15 @@ func TestGenerateMcporter_URLEntryAlreadyWrapped(t *testing.T) {
 	servers := result["mcpServers"].(map[string]interface{})
 	gw := servers["gateway"].(map[string]interface{})
 	// Should be skipped (already wrapped).
-	if gw["command"] != mcporterBinaryName {
+	if gw["command"] != currentPipelockExecutable() {
 		t.Fatal("already-wrapped URL entry should remain unchanged")
 	}
 }
 
 func TestGenerateMcporter_IsAlreadyWrapped_DashDashBeforeProxy(t *testing.T) {
 	// Args with -- before "proxy" should not be considered wrapped.
-	if isAlreadyWrapped(mcporterBinaryName, []string{"mcp", "--", "proxy"}) {
+	self := currentPipelockExecutable()
+	if isAlreadyWrapped(self, []string{"mcp", "--", "proxy"}, self) {
 		t.Fatal("should not detect as wrapped when -- appears before proxy")
 	}
 }
@@ -934,7 +1034,7 @@ func TestGenerateMcporter_PreservesPerServerExtraFields(t *testing.T) {
 
 	// stdio-server should be wrapped AND preserve extra fields.
 	stdio := servers["stdio-server"].(map[string]interface{})
-	if stdio["command"] != mcporterBinaryName {
+	if stdio["command"] != currentPipelockExecutable() {
 		t.Fatal("stdio-server should be wrapped")
 	}
 	if stdio["disabled"] != false {
@@ -951,7 +1051,7 @@ func TestGenerateMcporter_PreservesPerServerExtraFields(t *testing.T) {
 
 	// url-server should be wrapped AND preserve extra fields (except url).
 	urlSrv := servers["url-server"].(map[string]interface{})
-	if urlSrv["command"] != mcporterBinaryName {
+	if urlSrv["command"] != currentPipelockExecutable() {
 		t.Fatal("url-server should be wrapped")
 	}
 	if urlSrv["disabled"] != true {

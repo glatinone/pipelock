@@ -11,6 +11,7 @@
 <p align="center">
   <a href="https://github.com/luckyPipewrench/pipelock/actions/workflows/ci.yaml"><img alt="CI" src="https://github.com/luckyPipewrench/pipelock/actions/workflows/ci.yaml/badge.svg"></a>
   <a href="https://github.com/luckyPipewrench/pipelock/actions/workflows/security.yaml"><img alt="Security" src="https://github.com/luckyPipewrench/pipelock/actions/workflows/security.yaml/badge.svg"></a>
+  <a href="https://github.com/luckyPipewrench/pipelock/actions/workflows/continuous-gauntlet.yaml"><img alt="Gauntlet exam" src="https://github.com/luckyPipewrench/pipelock/actions/workflows/continuous-gauntlet.yaml/badge.svg"></a>
   <a href="go.mod"><img alt="Go 1.25+" src="https://img.shields.io/github/go-mod/go-version/luckyPipewrench/pipelock?logo=go&label=Go"></a>
   <a href="https://github.com/luckyPipewrench/pipelock/releases"><img alt="Release" src="https://img.shields.io/github/v/release/luckyPipewrench/pipelock"></a>
 </p>
@@ -35,7 +36,7 @@
 
 Pipelock sits between AI agents and the network. It inspects mediated HTTP, WebSocket, MCP, and A2A traffic, plus CONNECT tunnel contents when TLS interception is enabled, for secret exfiltration, prompt injection, SSRF, tool poisoning, and risky tool-call chains. Plain CONNECT without interception is scanned at the hostname and URL level.
 
-Pipelock emits mediator-signed [action receipts](https://pipelab.org/learn/action-receipt-spec/) over content-aware boundary decisions, so a reviewer can verify what Pipelock decided outside the agent runtime. The public [agent-egress-bench](https://github.com/luckyPipewrench/agent-egress-bench) corpus exercises the detections. Learn more: [Open-source AI firewall](https://pipelab.org/learn/open-source-ai-firewall/).
+Pipelock emits mediator-signed [action receipts](https://pipelab.org/learn/action-receipt-spec/) over content-aware boundary decisions, so a reviewer can verify what Pipelock decided outside the agent runtime. The public [agent-egress-bench](https://github.com/luckyPipewrench/agent-egress-bench) corpus exercises the detections. The [Gauntlet](https://github.com/luckyPipewrench/pipelock/actions/workflows/continuous-gauntlet.yaml) workflow is the product's scheduled candidate exam against a pinned corpus commit; it does not auto-publish a public score. Learn more: [Open-source AI firewall](https://pipelab.org/learn/open-source-ai-firewall/).
 
 **Works with:** Claude Code · OpenAI Codex · Cline · OpenCode · Zed · Cursor · VS Code · JetBrains · OpenAI Agents SDK · Google ADK · AutoGen · CrewAI · LangGraph
 
@@ -48,13 +49,13 @@ Pipelock emits mediator-signed [action receipts](https://pipelab.org/learn/actio
   <a href="#what-it-does">Features</a> ·
   <a href="#how-it-works">Architecture</a> ·
   <a href="#docs">Docs</a> ·
-  <a href="https://playground.pipelab.org">Playground</a> ·
+  <a href="https://pipelab.org/playground">Playground</a> ·
   <a href="https://pipelab.org/blog/">Blog</a> ·
   <a href="https://app.dosu.dev/bcccd1cf-be85-4c0e-ae05-edeb0ff50b59/ask">Ask Dosu</a>
 </p>
 
 <p align="center">
-  <strong>Try it in your browser at the <a href="https://playground.pipelab.org">live playground</a>. If Pipelock earns it, <a href="https://github.com/luckyPipewrench/pipelock/stargazers">star the repo</a> so other people find it.</strong>
+  <strong>Try it in your browser at the <a href="https://pipelab.org/playground">live playground</a>. If Pipelock earns it, <a href="https://github.com/luckyPipewrench/pipelock/stargazers">star the repo</a> so other people find it.</strong>
 </p>
 
 ---
@@ -88,11 +89,15 @@ pipelock verify-receipt "$(ls ./out/*.json | head -1)" --key ./out/signer.pub  #
 
 The scorecard grades each claim on its own and states what it does not prove: whether anything happened outside the boundary Pipelock mediates. Below it, the receipt timeline lists the recorded mediated decisions with their verdicts and hash links. A receipt that is honest about its own limits beats a green checkmark that hides them.
 
-The evidence viewer is free and needs no license:
+The evidence viewer is free and needs no license. It reads a flight-recorder
+session, which is what Pipelock writes while it runs, rather than the demo
+receipts above:
 
 ```bash
-pipelock evidence serve --receipt-dir ./out   # read-only HTML report for one recorded session
-pipelock evidence view --receipt-dir ./out    # static offline report, no server
+pipelock init --output ./pipelock.yaml        # names a recorder directory and generates its signing key
+pipelock run --config ./pipelock.yaml         # record while your agent works
+pipelock evidence view --receipt-dir ./recorder --out report.html   # static offline report, no server
+pipelock evidence serve --receipt-dir ./recorder                    # same report, served read-only
 ```
 
 Two honesty notes, stated up front. The demo signs with an ephemeral key it prints for the run, which proves the receipts are self-consistent rather than tied to a named identity. The public Pipelock playground is a separate path that verifies against a key Pipelock publishes. And the operator running Pipelock holds the signing key, so a receipt proves what the boundary decided and that the key holder signed it, not that the operator is honest. `pipelock anchor receipts` records receipt-chain checkpoints to a local backend or a Rekor transparency log for later audit, and operator-independent verification against that anchor is still being proven end to end.
@@ -135,8 +140,8 @@ brew install luckyPipewrench/tap/pipelock
 <summary>Verify release integrity</summary>
 
 ```bash
-gh attestation verify pipelock_3.3.0_linux_amd64.tar.gz --owner luckyPipewrench
-gh attestation verify oci://ghcr.io/luckypipewrench/pipelock:3.3.0 --owner luckyPipewrench
+gh attestation verify pipelock_3.4.0_linux_amd64.tar.gz --owner luckyPipewrench
+gh attestation verify oci://ghcr.io/luckypipewrench/pipelock:3.4.0 --owner luckyPipewrench
 ```
 
 Release workflows publish SLSA provenance, CycloneDX SBOMs, checksums, and signed container images. Source builds with `go install` produce a Community-only binary; pre-built release artifacts include paid-tier code that activates with a valid license key.
@@ -213,7 +218,7 @@ The free single-session evidence viewer shown above is separate. It needs no lic
 
 [**agent-egress-bench**](https://github.com/luckyPipewrench/agent-egress-bench) runs a corpus of agent-exfiltration and prompt-injection attacks against Pipelock, or against any other tool. The numbers come from a run anyone can repeat, not a claim.
 
-[**See the live results**](https://pipelab.org/gauntlet/) · [**Run it yourself**](https://github.com/luckyPipewrench/agent-egress-bench)
+[**See the live results**](https://pipelab.org/gauntlet/results/) · [**Run it yourself**](https://github.com/luckyPipewrench/agent-egress-bench)
 
 </div>
 
@@ -568,7 +573,7 @@ Production recipes for Docker Compose, Kubernetes sidecar + NetworkPolicy, iptab
 
 ```yaml
 # .github/workflows/pipelock.yaml
-- uses: luckyPipewrench/pipelock@v2
+- uses: luckyPipewrench/pipelock@4c748ab986d611138ce202ab800b16eca6fb589f # v3.4.0
   with:
     scan-diff: 'true'
     fail-on-findings: 'true'
@@ -744,7 +749,7 @@ Pipelock is tested like a security product. The open-source core has unit, integ
 | CI matrix | Go 1.25 + 1.26, CodeQL, golangci-lint |
 | Supply chain | SLSA provenance, CycloneDX SBOM, cosign signatures |
 
-Run `make test` to verify locally. Independent benchmark: the public [agent-egress-bench](https://github.com/luckyPipewrench/agent-egress-bench) corpus. See the [live results](https://pipelab.org/gauntlet/).
+Run `make test` to verify locally. First-party benchmark evidence: the public [agent-egress-bench](https://github.com/luckyPipewrench/agent-egress-bench) corpus. See the [live results](https://pipelab.org/gauntlet/results/).
 
 ---
 

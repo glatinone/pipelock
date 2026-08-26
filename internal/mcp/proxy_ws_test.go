@@ -6,6 +6,7 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +31,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/mcp/tools"
 	"github.com/luckyPipewrench/pipelock/internal/receipt"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
 	"github.com/luckyPipewrench/pipelock/internal/testwait"
 )
 
@@ -45,6 +47,25 @@ func testScannerForWS(t *testing.T) *scanner.Scanner {
 
 func wsURL(srv *httptest.Server) string {
 	return "ws" + strings.TrimPrefix(srv.URL, "http")
+}
+
+func TestA2ACardURLForWSUpstream(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "ws", in: "ws://agent.example/mcp", want: "http://agent.example/mcp"},
+		{name: "wss", in: "wss://agent.example/mcp", want: "https://agent.example/mcp"},
+		{name: "https", in: "https://agent.example/card", want: "https://agent.example/card"},
+		{name: "invalid", in: "%", want: "%"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := a2aCardURLForWSUpstream(tc.in); got != tc.want {
+				t.Fatalf("a2aCardURLForWSUpstream(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
 }
 
 func waitForResponse(t *testing.T, ch <-chan struct{}) {
@@ -171,6 +192,56 @@ func TestRunWSProxy_ForwardsCleanRequest(t *testing.T) {
 	}
 }
 
+func TestRunWSProxy_SignedAgentCardUsesHTTPEquivalentOrigin(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	card := signCard(t, baseCard(), priv, edHeader())
+	responseSent := make(chan struct{})
+	srv := wsRespondServer(t, []byte(`{"jsonrpc":"2.0","id":1,"result":`+string(card)+`}`), responseSent)
+	t.Cleanup(srv.Close)
+
+	cfg := sigScanCfg(pub, true)
+	cfg.TrustedAgentCardKeys = []config.A2ATrustedCardKey{{
+		KeyID:          testKeyID,
+		PublicKey:      signing.EncodePublicKey(pub),
+		AllowedOrigins: []string{srv.URL},
+	}}
+
+	pr, pw := io.Pipe()
+	var stdout, stderr lockedHTTPBuffer
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	var proxyErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		proxyErr = RunWSProxy(ctx, pr, &stdout, &stderr, wsURL(srv), MCPProxyOpts{
+			Scanner: testScannerForWS(t),
+			A2ACfg:  cfg,
+		})
+	}()
+
+	_, _ = pw.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"GetExtendedAgentCard","params":{}}` + "\n"))
+	waitForResponse(t, responseSent)
+	testwait.For(t, time.Second, func() bool {
+		return stdout.String() != ""
+	}, "WS proxy response")
+	_ = pw.Close()
+	wg.Wait()
+	if proxyErr != nil {
+		t.Fatalf("RunWSProxy: %v", proxyErr)
+	}
+	if !stdout.contains("Vendor Agent") {
+		t.Fatalf("valid signed Agent Card was not forwarded: %s", stdout.String())
+	}
+	if stdout.contains("pipelock") {
+		t.Fatalf("valid signed Agent Card was blocked: %s", stdout.String())
+	}
+}
+
 func TestRunWSProxy_UpstreamUsesConfiguredDialContext(t *testing.T) {
 	sc := testScannerForWS(t)
 	errDialBlocked := errors.New("sentinel dial blocked")
@@ -278,13 +349,16 @@ func TestRunWSProxy_BlocksInboundDLPResponse(t *testing.T) {
 	}
 }
 
+// The section action is warn here on purpose. Trust may only make scanning stricter than the
+// enclosing response_scanning.action, so a reasoning server forwards with a warning under a warn
+// section. Under a block section it now blocks, matching the stdio path.
 func TestRunWSProxy_MCPResponseTrustReasoningWarnsSecurityAnalysis(t *testing.T) {
 	responseSent := make(chan struct{})
 	response := []byte(makeResponse(1, reasoningPromptInjectionAnalysis))
 	srv := wsRespondServer(t, response, responseSent)
 	defer srv.Close()
 
-	sc := testScannerWithAction(t, config.ActionBlock)
+	sc := testScannerWithAction(t, config.ActionWarn)
 	pr, pw := io.Pipe()
 	var stdout, stderr lockedHTTPBuffer
 

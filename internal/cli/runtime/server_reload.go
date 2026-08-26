@@ -57,6 +57,11 @@ func (s *Server) Reload(newCfg *config.Config) (err error) {
 		s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
 		return rejectErr
 	}
+	if validationErr := newCfg.ValidateSuppressions(); validationErr != nil {
+		rejectErr := fmt.Errorf("rejected: invalid config reload: %w", validationErr)
+		s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
+		return rejectErr
+	}
 	if s.containmentManaged {
 		if containmentErr := validateContainmentMetricsConfig(newCfg); containmentErr != nil {
 			s.containmentMetricsDenied.Store(true)
@@ -358,11 +363,12 @@ func (s *Server) Reload(newCfg *config.Config) (err error) {
 			// analogue of the agents preserve path above.
 			_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: new license inputs could not be verified; Conductor fleet entitlement unchanged, follower stays running — requires restart for license re-verification\n")
 		}
-		// Carry forward runtime-derived license expiry.
-		// LicenseExpiresAt is set by EnforceLicenseGate at startup,
-		// not parsed from YAML. Always preserve the old value until
-		// restart.
+		// Carry forward runtime-derived license warning metadata. These claims
+		// are set after token verification at startup, not parsed from YAML.
+		// Always preserve the old values until restart.
 		newCfg.LicenseExpiresAt = oldCfg.LicenseExpiresAt
+		newCfg.LicenseIssuedAt = oldCfg.LicenseIssuedAt
+		newCfg.LicenseTier = oldCfg.LicenseTier
 		newCfg.LicenseID = oldCfg.LicenseID
 		newCfg.LicenseCRLExpiresAt = oldCfg.LicenseCRLExpiresAt
 		newCfg.LicenseCRLSHA256 = oldCfg.LicenseCRLSHA256

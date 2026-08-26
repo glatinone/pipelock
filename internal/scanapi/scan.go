@@ -144,7 +144,8 @@ func scanEmbeddedTextURLs(ctx context.Context, sc *scanner.Scanner, text string)
 func embeddedHTTPURLTokens(text string, limit int) ([]string, bool) {
 	seen := make(map[string]struct{})
 	tokens := make([]string, 0, limit)
-	for _, view := range embeddedURLTextViews(text) {
+	views, viewsTruncated := embeddedURLTextViews(text)
+	for _, view := range views {
 		for _, raw := range embeddedHTTPURLTokenRe.FindAllString(view, -1) {
 			token := strings.TrimRight(raw, ".,;)]}")
 			if token == "" {
@@ -160,31 +161,57 @@ func embeddedHTTPURLTokens(text string, limit int) ([]string, bool) {
 			tokens = append(tokens, token)
 		}
 	}
-	return tokens, false
+	// A view-building bound that stopped early means the token list may be
+	// incomplete even when the token cap was never reached.
+	return tokens, viewsTruncated
 }
 
-func embeddedURLTextViews(text string) []string {
+// embeddedURLTextViews builds the decoded views the URL token matcher reads.
+// It returns truncated=true when either bound stopped it while more decoding
+// was still productive: the view cap, or the decode-pass budget. Both were
+// previously silent, so a URL wrapped past the ceiling yielded no token and the
+// caller reported a clean allow on content it had not finished inspecting. The
+// token-count cap already reported this way; these two now match it.
+func embeddedURLTextViews(text string) ([]string, bool) {
 	views := make([]string, 0, 4)
 	seen := make(map[string]struct{}, 4)
+	truncated := false
+	// addView records a view and, when that view carries escaped slashes, its
+	// slash-decoded form. Both are decided in ONE capacity check: the cap could
+	// otherwise fill between the two appends and drop the decoded form, which
+	// may be the first form containing a literal scheme. A view the bound
+	// refuses must set truncated rather than vanish, because the caller treats
+	// truncation as "inspection did not finish" and denies.
 	addView := func(view string) {
-		if len(views) >= maxEmbeddedURLTextViews {
+		if _, ok := seen[view]; ok {
 			return
 		}
-		if _, ok := seen[view]; ok {
+		slashDecoded := ""
+		if strings.Contains(view, `\/`) {
+			if decoded := strings.ReplaceAll(view, `\/`, `/`); decoded != view {
+				if _, dup := seen[decoded]; !dup {
+					slashDecoded = decoded
+				}
+			}
+		}
+		needed := 1
+		if slashDecoded != "" {
+			needed = 2
+		}
+		if len(views)+needed > maxEmbeddedURLTextViews {
+			truncated = true
 			return
 		}
 		seen[view] = struct{}{}
 		views = append(views, view)
-		if strings.Contains(view, `\/`) && len(views) < maxEmbeddedURLTextViews {
-			slashDecoded := strings.ReplaceAll(view, `\/`, `/`)
-			if _, ok := seen[slashDecoded]; !ok {
-				seen[slashDecoded] = struct{}{}
-				views = append(views, slashDecoded)
-			}
+		if slashDecoded != "" {
+			seen[slashDecoded] = struct{}{}
+			views = append(views, slashDecoded)
 		}
 	}
 	addView(text)
 
+	converged := false
 	for range maxEmbeddedURLDecodePasses {
 		startLen := len(views)
 		for _, view := range views[:startLen] {
@@ -202,10 +229,45 @@ func embeddedURLTextViews(text string) []string {
 			}
 		}
 		if len(views) == startLen {
+			// Nothing new decoded, so the payload is fully peeled. This is the
+			// normal exit and the only one that proves inspection completed.
+			converged = true
 			break
 		}
 	}
-	return views
+	if !converged && anyViewDecodesFurther(views, seen) {
+		// The pass budget ran out AND a further pass would still produce a view
+		// nobody has seen, so a layer genuinely went unread. Exhausting the
+		// budget alone is not evidence of that: a payload can converge exactly
+		// on the final pass, having been fully decoded, and flagging that as
+		// truncated denies content the scanner actually finished inspecting.
+		truncated = true
+	}
+	return views, truncated
+}
+
+// anyViewDecodesFurther reports whether decoding the current views once more
+// would yield a view not already collected. It is a read-only probe: it does not
+// add views, so it answers "was inspection incomplete" without extending the
+// bound the caller chose.
+func anyViewDecodesFurther(views []string, seen map[string]struct{}) bool {
+	for _, view := range views {
+		if strings.Contains(view, "%") {
+			if decoded, err := url.PathUnescape(view); err == nil && decoded != view {
+				if _, ok := seen[decoded]; !ok {
+					return true
+				}
+			}
+		}
+		if strings.Contains(view, "&") {
+			if decoded := html.UnescapeString(view); decoded != view {
+				if _, ok := seen[decoded]; !ok {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func embeddedURLResultIsFinding(result scanner.Result) bool {

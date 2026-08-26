@@ -18,12 +18,12 @@ import (
 
 	"github.com/luckyPipewrench/pipelock/internal/addressprotect"
 	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/authority"
 	"github.com/luckyPipewrench/pipelock/internal/blockreason"
 	"github.com/luckyPipewrench/pipelock/internal/capture"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/decide"
 	"github.com/luckyPipewrench/pipelock/internal/envelope"
-	"github.com/luckyPipewrench/pipelock/internal/hitl"
 	"github.com/luckyPipewrench/pipelock/internal/mcp"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/receipt"
@@ -153,6 +153,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// Strip inbound mediation envelope headers after optional trust
 	// verification so forged mediation metadata cannot survive to upstreams.
 	envelope.StripInbound(r.Header)
+	authorityRef, authorityCarrierErr := consumeAuthorityHeader(r)
 
 	agentLabel := id.Profile // bounded cardinality for Prometheus labels
 	sc, releaseScanner, scOK := p.pinResolvedScanner(resolved)
@@ -594,6 +595,28 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if err := p.authorizeForward(r.Context(), authorityRef, authorityCarrierErr, authority.Request{
+		Actor:       agent,
+		Action:      string(receipt.ActionRead),
+		Destination: target,
+	}, targetCtx, TransportConnect); err != nil {
+		emitConnectReceipt(receipt.EmitOpts{
+			ActionID:  actionID,
+			Verdict:   config.ActionBlock,
+			Layer:     blockLayerAuthority,
+			Pattern:   "authority verification failed",
+			Transport: TransportConnect,
+			Method:    http.MethodConnect,
+			Target:    connectReceiptTarget,
+			RequestID: requestID,
+			Agent:     agent,
+		})
+		p.metrics.RecordTunnelBlocked(agentLabel)
+		writeBlockedError(w,
+			blockInfoFor(blockreason.AuthorityMismatch, blockLayerAuthority),
+			"CONNECT blocked: authority verification failed", http.StatusForbidden)
+		return
+	}
 
 	allowReceipt := receipt.EmitOpts{
 		ActionID:  actionID,
@@ -890,6 +913,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	// Strip inbound mediation envelope headers after optional trust
 	// verification so forged mediation metadata cannot survive to upstreams.
 	envelope.StripInbound(r.Header)
+	authorityRef, authorityCarrierErr := consumeAuthorityHeader(r)
 	agentLabel := id.Profile // bounded cardinality for Prometheus labels
 	sc, releaseScanner, scOK := p.pinResolvedScanner(resolved)
 	defer releaseScanner()
@@ -1028,7 +1052,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		DeferClean: true,
 	})
 
-	forwardSessionKey := ceeSessionKey(agent, clientIP, id.Auth)
+	forwardSessionKey := responseTaintSessionKey(agent, clientIP, id.Auth)
 	var forwardRec session.Recorder
 	if sm := p.sessionMgrPtr.Load(); sm != nil {
 		forwardRec = sm.GetOrCreate(forwardSessionKey)
@@ -1118,7 +1142,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if gitPush := evaluateGitPushAllowlist(cfg.GitProtection, r.URL); gitPush.Block {
+	if gitPush := evaluateGitPushAllowlist(cfg.GitProtection, r.Method, r.URL); gitPush.Block {
 		p.logger.LogBlocked(actx, "git_protection", gitPush.Reason)
 		emitForwardReceipt(receipt.EmitOpts{
 			ActionID:  actionID,
@@ -1148,8 +1172,8 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 				Authority:   forwardTaint.Authority.String(),
 				Decision:    forwardTaint.Result.Decision.String(),
 				Reason:      forwardTaint.Result.Reason,
-				SourceURL:   forwardTaint.Risk.LastExternalURL,
-				SourceKind:  forwardTaint.Risk.LastExternalKind,
+				SourceURL:   forwardTaint.Risk.SecurityOriginURL(),
+				SourceKind:  forwardTaint.Risk.SecurityOriginKind(),
 			},
 		)
 	}
@@ -1182,22 +1206,8 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case session.PolicyAsk:
 		forwardRequiresReauth = true
-		decision := hitl.DecisionBlock
-		blockReason := forwardTaint.Result.Reason
-		switch {
-		case p.approver == nil:
-			blockReason += " (no HITL approver)"
-		case !p.approver.IsTerminal():
-			blockReason += " (HITL stdin is not a terminal)"
-		default:
-			decision = p.approver.Ask(&hitl.Request{
-				Agent:   agent,
-				URL:     targetURL,
-				Reason:  forwardTaint.Result.Reason,
-				Preview: fmt.Sprintf("%s %s", r.Method, targetURL),
-			})
-		}
-		if decision != hitl.DecisionAllow {
+		approved, blockReason := p.resolveTaintAsk(agent, targetURL, r.Method, forwardTaint.Result.Reason)
+		if !approved {
 			emitForwardReceipt(receipt.EmitOpts{
 				ActionID:            actionID,
 				Verdict:             config.ActionBlock,
@@ -1696,7 +1706,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	// URL path, query params, and request body as outbound data.
 	ceeAdmission := p.admitCurrentCEE(r.Context(), ceeAdmitRequest{
 		SessionKey: ceeSessionKey(agent, clientIP, id.Auth), Outbound: extractOutboundPayload(r),
-		KeyPayload: queryParamKeys(r.URL), TargetURL: targetURL, Agent: agent, ClientIP: clientIP,
+		KeyPayload: queryParamKeys(r.URL), PathPayload: pathSegments(r.URL), TargetURL: targetURL, Agent: agent, ClientIP: clientIP,
 		RequestID: requestID, IncludeFragments: true,
 	})
 	if ceeAdmission.Active {
@@ -1852,6 +1862,27 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		writeGateBlockedError(w, gate, "blocked: "+reason)
 		return
 	}
+	if err := p.authorizeForward(r.Context(), authorityRef, authorityCarrierErr, authority.Request{
+		Actor:       agent,
+		Action:      string(receipt.ClassifyHTTP(r.Method)),
+		Destination: targetURL,
+	}, actx, TransportForward); err != nil {
+		emitForwardReceipt(withForwardRedaction(forwardBlockReceiptOpts(ForwardBlockReceiptInput{
+			ActionID:  actionID,
+			RequestID: requestID,
+			Agent:     agent,
+			Method:    r.Method,
+			Target:    targetURL,
+			Layer:     blockLayerAuthority,
+			Pattern:   "authority verification failed",
+			Taint:     forwardTaint,
+		})))
+		p.metrics.RecordBlocked(r.URL.Hostname(), blockLayerAuthority, time.Since(start), agentLabel)
+		writeBlockedError(w,
+			blockInfoFor(blockreason.AuthorityMismatch, blockLayerAuthority),
+			"blocked: authority verification failed", http.StatusForbidden)
+		return
+	}
 
 	// Clone request with context keys so CheckRedirect uses the per-agent
 	// config/scanner for redirect enforcement, not the global default.
@@ -1862,6 +1893,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx = context.WithValue(ctx, ctxKeyAgentScanner, sc)
 	ctx = context.WithValue(ctx, ctxKeyAgentContractLoader, snapshotContractLoader)
 	ctx = context.WithValue(ctx, ctxKeyRedirectTransport, TransportForward)
+	ctx = context.WithValue(ctx, ctxKeyRedirectSessionRecorder, forwardRec)
 	ctx = withAllowedSSRFDialScanSnapshot(ctx, sc, r.URL.Hostname(), effectiveURLPort(r.URL), result)
 	outReq := r.Clone(ctx)
 	outReq.RequestURI = "" // required for http.Client
@@ -2005,6 +2037,13 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if blockedErr, ok := blockedRequestErrorFrom(err); ok {
 			p.logger.LogBlocked(actx, blockedErr.layer, blockedErr.detail)
+			// A redirect-time taint denial supersedes the admission decision.
+			// Preserve whether the matrix blocked outright or requested HITL;
+			// the receipt verdict already records the terminal block outcome.
+			redirectTaint := forwardTaint
+			if blockedErr.taint != nil {
+				redirectTaint = *blockedErr.taint
+			}
 			emitForwardReceipt(withForwardRedaction(receipt.EmitOpts{
 				ActionID:            actionID,
 				Verdict:             config.ActionBlock,
@@ -2012,18 +2051,18 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 				Pattern:             blockedErr.reason,
 				Transport:           "forward",
 				Method:              r.Method,
-				Target:              targetURL,
+				Target:              redirectReceiptTarget(blockedErr, targetURL),
 				RequestID:           requestID,
 				Agent:               agent,
-				SessionTaintLevel:   forwardTaint.Risk.Level.String(),
-				SessionContaminated: forwardTaint.Risk.Contaminated,
-				RecentTaintSources:  forwardTaint.Risk.Sources,
-				SessionTaskID:       forwardTaint.Task.CurrentTaskID,
-				SessionTaskLabel:    forwardTaint.Task.CurrentTaskLabel,
-				AuthorityKind:       forwardTaint.Authority.String(),
-				TaintDecision:       forwardTaint.Result.Decision.String(),
-				TaintDecisionReason: forwardTaint.Result.Reason,
-				TaskOverrideApplied: forwardTaint.TaskOverrideApplied,
+				SessionTaintLevel:   redirectTaint.Risk.Level.String(),
+				SessionContaminated: redirectTaint.Risk.Contaminated,
+				RecentTaintSources:  redirectTaint.Risk.Sources,
+				SessionTaskID:       redirectTaint.Task.CurrentTaskID,
+				SessionTaskLabel:    redirectTaint.Task.CurrentTaskLabel,
+				AuthorityKind:       redirectTaint.Authority.String(),
+				TaintDecision:       redirectTaint.Result.Decision.String(),
+				TaintDecisionReason: redirectTaint.Result.Reason,
+				TaskOverrideApplied: redirectTaint.TaskOverrideApplied,
 			}))
 			p.metrics.RecordBlocked(r.URL.Hostname(), blockedErr.layer, time.Since(start), agentLabel)
 			// Open-redirect hint fires on any fail-closed redirect
@@ -2466,6 +2505,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 
 		// Browser Shield on forward proxy responses. Use post-redirect host
 		// so exempt_domains checks match the actual response origin.
+		shieldBodyLen := len(respBody)
 		var shieldBlocked bool
 		var shieldSummary *receipt.ShieldSummary
 		respBody, shieldSummary, shieldBlocked = p.applyShield(respBody, resp.Header.Get("Content-Type"), fwdRespHost, resp.Header, cfg, actx, clientIP, requestID, TransportForward, actionID)
@@ -2473,7 +2513,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 			p.metrics.RecordBlocked(fwdRespHost, "shield_oversize", time.Since(start), agentLabel)
 			writeBlockedError(w,
 				blockInfoFor(blockreason.BrowserShieldOversize, "shield_oversize"),
-				"blocked: response body exceeds browser shield size limit", http.StatusForbidden)
+				"blocked: "+shieldOversizeBlockReason(fwdRespHost, shieldBodyLen, cfg.BrowserShield.MaxShieldBytes), http.StatusForbidden)
 			outcomeStatus = strconv.Itoa(http.StatusForbidden)
 			outcomeBytes = int64(len(respBody))
 			outcomeReason = "shield_oversize"

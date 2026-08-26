@@ -63,7 +63,8 @@ an instruction file is high. Use --min-severity to control what causes a
 non-zero exit. The default gates on high severity and reports lower severities.
 
 Exit codes: 0 = no gated findings; 1 = findings at/above --min-severity;
-2 = scan/config error, an explicitly named file was skipped (binary, symlink,
+2 = scan/config error, an agent-context file could not be inspected so its
+content is unknown, an explicitly named file was skipped (binary, UTF-16, symlink,
 oversized), or --fail-on-skip and any file was skipped.
 
 Examples:
@@ -107,6 +108,16 @@ Examples:
 				res.WriteReport(w)
 			}
 
+			// A declared agent-context file whose content could not be inspected
+			// always fails, whether a file was named directly or a directory was
+			// walked. That asymmetry is fine for ordinary assets, where naming a
+			// binary is an explicit request and finding one in a tree is not, but
+			// on the file class this command exists to check it meant one appended
+			// NUL byte turned a high finding into exit 0.
+			if len(res.Refused) > 0 {
+				return cliutil.ExitCodeError(exitError,
+					fmt.Errorf("scan could not inspect %d agent-context file(s); their content is unknown", len(res.Refused)))
+			}
 			if failOnSkip && len(res.Skipped) > 0 {
 				return cliutil.ExitCodeError(exitError,
 					fmt.Errorf("scan skipped %d file(s); rerun without --fail-on-skip to allow skips", len(res.Skipped)))

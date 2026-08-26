@@ -83,6 +83,7 @@ servers are skipped (idempotent). A .bak backup is created before
 modification. Non-server fields are preserved.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Args:          cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runClineInstall(cmd, path, dryRun, configFile)
 		},
@@ -109,6 +110,7 @@ pipelock install. Original server configurations are restored from the
 _pipelock metadata field. Non-wrapped servers are left unchanged.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Args:          cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runClineRemove(cmd, path, dryRun)
 		},
@@ -169,10 +171,11 @@ func runClineInstall(cmd *cobra.Command, override string, dryRun bool, configFil
 	skipped := 0
 	var sidecarOps []sidecarOp
 	for name, server := range mcpCfg.Servers {
-		if isVscodeWrapped(server) {
+		if isWrappedBySelf(server) {
 			skipped++
 			continue
 		}
+		warnForeignWrapper(cmd.ErrOrStderr(), name, server)
 
 		newServer, meta, plan, err := wrapClineServer(server, exe, configFile, targetPath, name)
 		if err != nil {
@@ -265,11 +268,12 @@ func runClineRemove(cmd *cobra.Command, override string, dryRun bool) error {
 	unwrapped := 0
 	var sidecarOps []sidecarOp
 	for name, server := range mcpCfg.Servers {
-		if !isVscodeWrapped(server) {
+		if !isRestorableWrapper(server) {
+			warnUnrestorableWrapper(cmd.ErrOrStderr(), name, server)
 			continue
 		}
 
-		restored, plan, err := unwrapVscodeServer(server)
+		restored, plan, err := unwrapVscodeServer(server, targetPath, name)
 		if err != nil {
 			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not unwrap %q: %v\n", name, err)
 			continue

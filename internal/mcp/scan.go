@@ -182,11 +182,17 @@ func scanResponseOpts(line []byte, sc *scanner.Scanner, opts ResponseScanOptions
 	}
 }
 
+// responseScanAction resolves the effective response-scan action. A per-server
+// trust override may only make scanning stricter than the section action, never
+// weaker, so the override is clamped against it rather than replacing it. The
+// callers that build the override clamp it too; this is the enforcement-side
+// backstop, and clamping twice is idempotent.
 func responseScanAction(sc *scanner.Scanner, opts ResponseScanOptions) string {
-	if opts.ActionOverride != "" {
-		return opts.ActionOverride
+	sectionAction := sc.ResponseAction()
+	if opts.ActionOverride == "" {
+		return sectionAction
 	}
-	return sc.ResponseAction()
+	return config.StricterAction(opts.ActionOverride, sectionAction)
 }
 
 func responseScanTrustClass(opts ResponseScanOptions) string {
@@ -605,68 +611,97 @@ type A2AResponseOpts struct {
 	Cfg      *config.A2AScanning
 	Baseline *CardBaseline
 	// CardKey identifies the Agent Card origin for drift detection.
-	// Only used for GetExtendedAgentCard responses.
+	// Used for GetExtendedAgentCard / agent/getAuthenticatedExtendedCard
+	// responses and for card-shaped results when the method is unknown.
 	CardKey cardCacheKey
 	// Method is the JSON-RPC method from the corresponding request.
 	// When non-empty, allows precise A2A response routing without
 	// relying on response shape heuristics.
 	Method string
+	// ScanOpts is the per-server suppression context used when A2A
+	// scanning is disabled or the response is ordinary MCP traffic.
+	// The zero value preserves ScanResponse (no suppression) behavior.
+	ScanOpts ResponseScanOptions
 }
-
-// methodGetExtendedAgentCard is the A2A method that returns an Agent Card.
-const methodGetExtendedAgentCard = "GetExtendedAgentCard"
 
 // ScanResponseA2A scans a JSON-RPC 2.0 response with optional A2A-aware
 // routing. When a2aOpts is non-nil and the response matches an A2A method
 // (by tracked method name or response shape), field-aware A2A scanning runs
-// instead of generic text extraction. Falls back to ScanResponse for
-// non-A2A traffic or when A2A scanning is disabled.
+// instead of generic text extraction. Falls back to ScanResponseOpts for
+// non-A2A traffic or when A2A scanning is disabled so per-server suppression
+// stays in effect on the generic path.
 func ScanResponseA2A(line []byte, sc *scanner.Scanner, a2aOpts *A2AResponseOpts) jsonrpc.ScanVerdict {
 	// Nil-safe: no A2A config means standard MCP scanning.
 	if a2aOpts == nil || a2aOpts.Cfg == nil || !a2aOpts.Cfg.Enabled {
-		return ScanResponse(line, sc)
+		return a2aFallbackScan(line, sc, a2aOpts)
 	}
 
-	// Route by tracked method name when available (most precise).
-	if a2aOpts.Method != "" && IsA2AMethod(a2aOpts.Method) {
+	// Route by tracked method name when available (most precise). Without
+	// request correlation, only a complete Agent Card shape is specific enough
+	// to use A2A scanning: ordinary MCP responses can also carry task-like
+	// status and history fields, and must retain their response policy.
+	isA2A := a2aOpts.Method != "" && IsA2AMethod(a2aOpts.Method)
+	if !isA2A {
+		isA2A = isAgentCardResultShape(line)
+	}
+	if isA2A {
+		if verdict, batch := validateA2AResponseEnvelope(line); batch {
+			return a2aFallbackScan(line, sc, a2aOpts)
+		} else if !verdict.Clean {
+			return verdict
+		}
 		return scanA2AResponseDispatch(line, sc, a2aOpts)
 	}
 
-	// Fallback: detect A2A response shape from result structure.
-	if isA2AResponseShape(line) {
-		return scanA2AResponseDispatch(line, sc, a2aOpts)
-	}
+	return a2aFallbackScan(line, sc, a2aOpts)
+}
 
-	return ScanResponse(line, sc)
+// validateA2AResponseEnvelope preserves the JSON-RPC gate shared by generic
+// MCP response scanning before a field-aware A2A scanner handles the result.
+// It reports a batch separately because ScanResponseOpts owns element-wise
+// batch validation and routing.
+func validateA2AResponseEnvelope(line []byte) (jsonrpc.ScanVerdict, bool) {
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		return jsonrpc.ScanVerdict{}, true
+	}
+	if err := redact.NoDuplicateJSONKeys(trimmed); err != nil && redact.IsDuplicateKeyBlock(err) {
+		return jsonrpc.ScanVerdict{
+			ID:    recoverTopLevelJSONRPCID(trimmed),
+			Clean: false,
+			Error: fmt.Sprintf("duplicate JSON object key: %v", err),
+		}, false
+	}
+	var rpc jsonrpc.RPCResponse
+	if err := json.Unmarshal(trimmed, &rpc); err != nil {
+		return jsonrpc.ScanVerdict{Clean: false, Error: fmt.Sprintf("invalid JSON: %v", err)}, false
+	}
+	if rpc.JSONRPC != jsonrpc.Version {
+		return jsonrpc.ScanVerdict{
+			ID:    rpc.ID,
+			Clean: false,
+			Error: fmt.Sprintf("not a JSON-RPC 2.0 response: jsonrpc=%q", rpc.JSONRPC),
+		}, false
+	}
+	return jsonrpc.ScanVerdict{ID: rpc.ID, Clean: true}, false
+}
+
+func a2aFallbackScan(line []byte, sc *scanner.Scanner, a2aOpts *A2AResponseOpts) jsonrpc.ScanVerdict {
+	if a2aOpts == nil {
+		return ScanResponseOpts(line, sc, ResponseScanOptions{})
+	}
+	return ScanResponseOpts(line, sc, a2aOpts.ScanOpts)
 }
 
 // scanA2AResponseDispatch routes an A2A response through the appropriate
-// scanner based on method type.
+// scanner based on method type and result shape. Card methods and card-shaped
+// results always take the Agent Card path so signature and drift checks cannot
+// be skipped by omitting a tracked method or by a case-folded method name.
 func scanA2AResponseDispatch(line []byte, sc *scanner.Scanner, a2aOpts *A2AResponseOpts) jsonrpc.ScanVerdict {
 	rpcID := extractRPCID(line)
 
-	// GetExtendedAgentCard: route through Agent Card scanner.
-	if a2aOpts.Method == methodGetExtendedAgentCard {
-		// Extract result body for card scanning.
-		var rpc jsonrpc.RPCResponse
-		if err := json.Unmarshal(line, &rpc); err != nil {
-			return jsonrpc.ScanVerdict{Clean: false, Error: fmt.Sprintf("invalid JSON: %v", err)}
-		}
-		// Scan error payloads: a malicious server can inject content via
-		// error.message and error.data. Don't skip scanning just because
-		// the response is an error instead of a result.
-		if len(rpc.Error) > 0 && string(rpc.Error) != jsonrpc.Null {
-			errResult := ScanA2AResponseBody(context.Background(), line, sc, a2aOpts.Cfg)
-			return a2aScanToVerdict(rpcID, errResult)
-		}
-		if len(rpc.Result) == 0 || string(rpc.Result) == jsonrpc.Null {
-			return jsonrpc.ScanVerdict{ID: rpcID, Clean: true}
-		}
-		cardResult := ScanAgentCard(
-			context.Background(), rpc.Result, sc,
-			a2aOpts.Baseline, a2aOpts.CardKey, a2aOpts.Cfg,
-		)
-		return agentCardToVerdict(rpcID, cardResult, a2aOpts.Cfg)
+	if isAgentCardMethod(a2aOpts.Method) || isAgentCardResultShape(line) {
+		return scanAgentCardRPCResponse(line, sc, a2aOpts, rpcID)
 	}
 
 	// All other A2A methods: field-aware body scanning.
@@ -674,38 +709,69 @@ func scanA2AResponseDispatch(line []byte, sc *scanner.Scanner, a2aOpts *A2ARespo
 	return a2aScanToVerdict(rpcID, result)
 }
 
+func scanAgentCardRPCResponse(line []byte, sc *scanner.Scanner, a2aOpts *A2AResponseOpts, rpcID json.RawMessage) jsonrpc.ScanVerdict {
+	var rpc jsonrpc.RPCResponse
+	if err := json.Unmarshal(line, &rpc); err != nil {
+		return jsonrpc.ScanVerdict{Clean: false, Error: fmt.Sprintf("invalid JSON: %v", err)}
+	}
+	// Scan error payloads: a malicious server can inject content via
+	// error.message and error.data. Don't skip scanning just because
+	// the response is an error instead of a result.
+	if len(rpc.Error) > 0 && string(rpc.Error) != jsonrpc.Null {
+		errResult := ScanA2AResponseBody(context.Background(), line, sc, a2aOpts.Cfg)
+		return a2aScanToVerdict(rpcID, errResult)
+	}
+	if len(rpc.Result) == 0 || string(rpc.Result) == jsonrpc.Null {
+		return jsonrpc.ScanVerdict{ID: rpcID, Clean: true}
+	}
+	cardResult := ScanAgentCard(
+		context.Background(), rpc.Result, sc,
+		a2aOpts.Baseline, a2aOpts.CardKey, a2aOpts.Cfg,
+	)
+	return agentCardToVerdict(rpcID, cardResult, a2aOpts.Cfg)
+}
+
 // isA2AResponseShape returns true if the JSON-RPC result object has fields
 // characteristic of A2A protocol responses (task with status/artifacts/history,
 // or an Agent Card shape with skills/supportedInterfaces).
 func isA2AResponseShape(line []byte) bool {
+	fields, ok := a2aResultObjectFields(line)
+	if !ok {
+		return false
+	}
+	return isA2ATaskFields(fields) || isAgentCardFields(fields)
+}
+
+func isAgentCardResultShape(line []byte) bool {
+	fields, ok := a2aResultObjectFields(line)
+	return ok && isAgentCardFields(fields)
+}
+
+func a2aResultObjectFields(line []byte) (map[string]json.RawMessage, bool) {
 	var probe struct {
 		Result json.RawMessage `json:"result"`
 	}
 	if json.Unmarshal(line, &probe) != nil || len(probe.Result) == 0 {
-		return false
+		return nil, false
 	}
-
-	// Check for A2A task shape: presence of status + (artifacts OR history).
 	var resultFields map[string]json.RawMessage
 	if json.Unmarshal(probe.Result, &resultFields) != nil {
-		return false
+		return nil, false
 	}
+	return resultFields, true
+}
 
+func isA2ATaskFields(resultFields map[string]json.RawMessage) bool {
 	_, hasStatus := resultFields["status"]
 	_, hasArtifacts := resultFields["artifacts"]
 	_, hasHistory := resultFields["history"]
-	if hasStatus && (hasArtifacts || hasHistory) {
-		return true
-	}
+	return hasStatus && (hasArtifacts || hasHistory)
+}
 
-	// Check for Agent Card shape: skills + supportedInterfaces.
+func isAgentCardFields(resultFields map[string]json.RawMessage) bool {
 	_, hasSkills := resultFields["skills"]
 	_, hasInterfaces := resultFields["supportedInterfaces"]
-	if hasSkills && hasInterfaces {
-		return true
-	}
-
-	return false
+	return hasSkills && hasInterfaces
 }
 
 // a2aScanToVerdict converts an A2AScanResult into a jsonrpc.ScanVerdict

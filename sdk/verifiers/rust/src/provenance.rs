@@ -11,8 +11,13 @@ use std::collections::BTreeSet;
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 use url::Url;
 
-pub const PROFILE_DIGEST: &str =
+pub const PROFILE_DIGEST_V1: &str =
     "sha256:3de14968449593cae58da869cfc97855cb098e491494390a12ba742cb0b70f94";
+pub const PROFILE_DIGEST_V2: &str =
+    "sha256:01e022d444562a25591cd379e894f5f6cde9eda9527fb92af2330373a25e7af7";
+// Retained for v1-oriented callers; receipt replay always resolves the exact
+// supplied digest rather than falling back to this value.
+pub const PROFILE_DIGEST: &str = PROFILE_DIGEST_V1;
 const MAX_INPUT: usize = 2 * 1024 * 1024;
 const MAX_OUTPUT: usize = 1024 * 1024;
 const MAX_OPERATIONS: usize = 32;
@@ -30,12 +35,22 @@ struct Operation {
     fields: Map<String, Value>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProfileVersion {
+    V1,
+    V2,
+}
+
+pub fn is_known_profile_digest(digest: &str) -> bool {
+    matches!(digest, PROFILE_DIGEST_V1 | PROFILE_DIGEST_V2)
+}
+
 impl Recipe {
     /// Builds a strict recipe from its signed JSON representation. `operations`
     /// must be an array; each operation rejects unknown, missing, and forbidden
     /// fields, including explicit false/zero values.
     pub fn from_json(digest: &str, operations: &Value) -> Result<Self, String> {
-        validate_digest(digest)?;
+        let profile = validate_digest(digest)?;
         let operations = operations
             .as_array()
             .ok_or_else(|| "recipe operations must be an array".to_string())?;
@@ -47,6 +62,13 @@ impl Recipe {
             .enumerate()
             .map(|(i, v)| Operation::from_json(v).map_err(|e| format!("recipe operation {i}: {e}")))
             .collect::<Result<Vec<_>, _>>()?;
+        if profile == ProfileVersion::V1
+            && operations
+                .iter()
+                .any(|operation| operation.kind == "ascii_alphanumeric_strip")
+        {
+            return Err("ascii_alphanumeric_strip is unsupported by transform profile".to_string());
+        }
         Ok(Self {
             digest: digest.to_string(),
             operations,
@@ -83,11 +105,11 @@ impl Recipe {
         if input.len() > MAX_INPUT {
             return Err("recipe input: exceeds profile byte limit".to_string());
         }
-        validate_digest(&self.digest)?;
+        let profile = validate_digest(&self.digest)?;
         for (i, operation) in self.operations.iter().enumerate() {
             budget.charge(&value)?;
             value = operation
-                .apply(&value, budget)
+                .apply(&value, budget, profile)
                 .map_err(|e| format!("recipe operation {i} ({}): {e}", operation.kind))?;
             if value.len() > MAX_OUTPUT {
                 return Err(format!(
@@ -190,7 +212,8 @@ impl Operation {
             | "url_noise_strip"
             | "ordered_query_concat"
             | "hostname_dot_remove"
-            | "canary_canonicalize" => (&["kind"], &[]),
+            | "canary_canonicalize"
+            | "ascii_alphanumeric_strip" => (&["kind"], &[]),
             "url_component" => (&["kind", "component"], &["selector", "occurrence"]),
             "percent_decode" => (&["kind", "passes"], &[]),
             "dlp_normalize" | "matching_normalize" => (&["kind", "profile"], &[]),
@@ -322,7 +345,12 @@ impl Operation {
         Ok(())
     }
 
-    fn apply<B: Budget>(&self, value: &str, budget: &mut B) -> Result<String, String> {
+    fn apply<B: Budget>(
+        &self,
+        value: &str,
+        budget: &mut B,
+        profile: ProfileVersion,
+    ) -> Result<String, String> {
         match self.kind.as_str() {
             "identity" => Ok(value.to_string()),
             "url_component" => url_component(
@@ -405,6 +433,7 @@ impl Operation {
             "encoded_token_normalize" => Ok(encoded_token_normalize(
                 value,
                 required_str(&self.fields, "alphabet")?,
+                profile,
             )),
             "text_segment" => text_segment(
                 value,
@@ -412,7 +441,7 @@ impl Operation {
             ),
             "html_entity_decode" => html_decode(value, budget),
             "whitespace_compact" => Ok(value.chars().filter(|c| !c.is_whitespace()).collect()),
-            "url_noise_strip" => Ok(strip_chars(value, "./ \t\n\r+,;|")),
+            "url_noise_strip" => Ok(url_noise_strip(value, profile)),
             "ordered_query_concat" => query_values(value)
                 .into_iter()
                 .map(|v| query_unescape(&v, budget))
@@ -443,12 +472,16 @@ impl Operation {
                 required_u32(&self.fields, "minimum_length")?,
             ),
             "canary_canonicalize" => Ok(strip_chars(value, "./\\?&= \t\n\r:;,-_@%+#")),
+            "ascii_alphanumeric_strip" => Ok(value
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .collect()),
             _ => unreachable!(),
         }
     }
 }
 
-fn validate_digest(digest: &str) -> Result<(), String> {
+fn validate_digest(digest: &str) -> Result<ProfileVersion, String> {
     if digest.is_empty() {
         return Err("recipe: missing transform profile digest".to_string());
     }
@@ -461,10 +494,11 @@ fn validate_digest(digest: &str) -> Result<(), String> {
     if !valid_shape {
         return Err("recipe: transform profile digest: invalid SHA-256 digest".to_string());
     }
-    if digest != PROFILE_DIGEST {
-        return Err("recipe: transform profile digest: unknown profile".to_string());
+    match digest {
+        PROFILE_DIGEST_V1 => Ok(ProfileVersion::V1),
+        PROFILE_DIGEST_V2 => Ok(ProfileVersion::V2),
+        _ => Err("recipe: transform profile digest: unknown profile".to_string()),
     }
-    Ok(())
 }
 fn required_str<'a>(m: &'a Map<String, Value>, key: &str) -> Result<&'a str, String> {
     m.get(key)
@@ -860,7 +894,85 @@ fn matching_normalize(s: &str) -> String {
 fn dlp_control_or_invisible(c: char) -> bool {
     (c <= '\u{1f}' || c == '\u{7f}' || ('\u{80}'..='\u{9f}').contains(&c)) || invisible(c)
 }
-fn encoded_token_normalize(s: &str, a: &str) -> String {
+// Deny-list mirroring scanner.go's normalizeHex (a=="hex") and
+// normalizeEncodedToken/isEncodedTokenByte (other alphabets): keep only the
+// target alphabet's own data bytes and drop everything else as noise. A byte
+// outside the alphabet no longer aborts normalization to "" -- every
+// non-data byte is now strippable, not just an enumerated separator set.
+fn encoded_token_normalize(s: &str, a: &str, profile: ProfileVersion) -> String {
+    if profile == ProfileVersion::V1 {
+        return encoded_token_normalize_v1(s, a);
+    }
+    encoded_token_normalize_v2(s, a)
+}
+
+fn encoded_token_normalize_v2(s: &str, a: &str) -> String {
+    if s.len() < 4 {
+        return String::new();
+    }
+    if a == "hex" {
+        let stripped = strip_v2_hex_prefixes(s);
+        // A separator is punctuation or whitespace, never a letter, so an
+        // out-of-alphabet letter means prose rather than a split token.
+        if stripped
+            .bytes()
+            .any(|b| b.is_ascii_alphabetic() && !b.is_ascii_hexdigit() && b != b'x' && b != b'X')
+        {
+            return String::new();
+        }
+        let v = stripped
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .collect::<String>();
+        return if !v.is_empty() && v.len() % 2 == 0 {
+            v
+        } else {
+            String::new()
+        };
+    }
+    let mut changed = false;
+    let mut out = String::new();
+    for b in s.bytes() {
+        let data = b.is_ascii_uppercase()
+            || (a != "base32" && b.is_ascii_lowercase())
+            || (b.is_ascii_digit() && (a != "base32" || (b'2'..=b'7').contains(&b)))
+            || b == b'='
+            || (a == "base64_standard" && matches!(b, b'+' | b'/'))
+            || (a == "base64_url" && matches!(b, b'-' | b'_'));
+        if data {
+            out.push(b as char)
+        } else {
+            changed = true
+        }
+    }
+    if changed && out.len() >= 4 {
+        out
+    } else {
+        String::new()
+    }
+}
+
+fn strip_v2_hex_prefixes(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut output = String::with_capacity(s.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if index + 3 < bytes.len()
+            && matches!(bytes[index], b'0' | b'\\')
+            && matches!(bytes[index + 1], b'x' | b'X')
+            && bytes[index + 2].is_ascii_hexdigit()
+            && bytes[index + 3].is_ascii_hexdigit()
+        {
+            index += 2;
+            continue;
+        }
+        output.push(bytes[index] as char);
+        index += 1;
+    }
+    output
+}
+
+fn encoded_token_normalize_v1(s: &str, a: &str) -> String {
     if s.len() < 4 {
         return String::new();
     }
@@ -888,13 +1000,13 @@ fn encoded_token_normalize(s: &str, a: &str) -> String {
             || b == b'='
             || (a == "base64_standard" && matches!(b, b'+' | b'/'))
             || (a == "base64_url" && matches!(b, b'-' | b'_'));
-        let sep = matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0c | 0x0b | b'.')
+        let separator = matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0c | 0x0b | b'.')
             || (a == "base64_standard" && matches!(b, b'-' | b'_'))
             || (a == "base64_url" && matches!(b, b'/' | b'+'))
             || (a == "base32" && matches!(b, b'-' | b'_' | b'/'));
         if data {
             out.push(b as char)
-        } else if sep {
+        } else if separator {
             changed = true
         } else {
             return String::new();
@@ -904,6 +1016,16 @@ fn encoded_token_normalize(s: &str, a: &str) -> String {
         out
     } else {
         String::new()
+    }
+}
+
+fn url_noise_strip(value: &str, profile: ProfileVersion) -> String {
+    match profile {
+        ProfileVersion::V1 => strip_chars(value, "./ \t\n\r+,;|"),
+        ProfileVersion::V2 => value
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '='))
+            .collect(),
     }
 }
 fn text_segment(s: &str, n: u32) -> Result<String, String> {

@@ -518,6 +518,9 @@ func TestRunHTTPProxy_SSEStreamingResponse(t *testing.T) {
 	}
 }
 
+// The section action is warn here on purpose. Trust may only make scanning stricter than the
+// enclosing response_scanning.action, so a reasoning server forwards with a warning under a warn
+// section. Under a block section it now blocks, matching every other transport.
 func TestRunHTTPProxy_MCPResponseTrustReasoningWarnsSecurityAnalysis(t *testing.T) {
 	result := makeResponse(1, reasoningPromptInjectionAnalysis)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -526,7 +529,7 @@ func TestRunHTTPProxy_MCPResponseTrustReasoningWarnsSecurityAnalysis(t *testing.
 	}))
 	defer srv.Close()
 
-	sc := testScannerWithAction(t, config.ActionBlock)
+	sc := testScannerWithAction(t, config.ActionWarn)
 	stdin := strings.NewReader(jsonToolsCallEcho + "\n")
 	var stdout, stderr bytes.Buffer
 
@@ -4091,6 +4094,9 @@ func TestHTTPListener_SSEUpstream_MultipleEvents(t *testing.T) {
 	}
 }
 
+// The section action is warn here on purpose. Trust may only make scanning stricter than the
+// enclosing response_scanning.action, so a reasoning server forwards with a warning under a warn
+// section. Under a block section it now blocks, matching every other transport.
 func TestHTTPListenerSSE_MCPResponseTrustReasoningWarnsSecurityAnalysis(t *testing.T) {
 	result := makeResponse(1, reasoningPromptInjectionAnalysis)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -4099,7 +4105,7 @@ func TestHTTPListenerSSE_MCPResponseTrustReasoningWarnsSecurityAnalysis(t *testi
 	}))
 	defer upstream.Close()
 
-	sc := testScannerWithAction(t, config.ActionBlock)
+	sc := testScannerWithAction(t, config.ActionWarn)
 	baseURL, logBuf := startListenerProxyWithOpts(t, upstream.URL, MCPProxyOpts{
 		Scanner:                sc,
 		ServerName:             "codex",

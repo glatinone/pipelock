@@ -121,7 +121,8 @@ func captureSessionKeyOriginal(agent, clientIP string) string {
 
 // ResetCEEState clears entropy and fragment state for a session identity.
 // Entropy tracker: clears CeeSessionKey(agent, ip) (base key only).
-// Fragment buffer: clears both CeeSessionKey(agent, ip) and CeeSessionKey(agent, ip)+"|keys".
+// Fragment buffer: clears every stream for that identity, so an operator reset
+// leaves no accumulated fragment state behind on any of them.
 // Safe to call with nil trackers (CEE disabled).
 func ResetCEEState(agent, clientIP string, et *scanner.EntropyTracker, fb *scanner.FragmentBuffer) {
 	key := CeeSessionKey(agent, clientIP)
@@ -130,8 +131,29 @@ func ResetCEEState(agent, clientIP string, et *scanner.EntropyTracker, fb *scann
 	}
 	if fb != nil {
 		fb.Delete(key)
-		fb.Delete(key + "|keys")
+		for _, suffix := range ceeFragmentStreamSuffixes {
+			fb.Delete(key + suffix)
+		}
 	}
+}
+
+// CEE fragment streams are buffered separately so unrelated text cannot
+// interrupt a reassembled secret. Each stream is the base session key plus its
+// suffix. ceeFragmentStreamSuffixes lists every non-base stream so an operator
+// reset clears all of them; a new stream must be added here as well.
+const (
+	ceeStreamKeysSuffix = "|keys"
+	ceeStreamPathSuffix = "|path"
+)
+
+var ceeFragmentStreamSuffixes = []string{ceeStreamKeysSuffix, ceeStreamPathSuffix}
+
+// ceePathPayload carries parsed path segments plus the bounded-parser result.
+// A path deeper than scanner.MaxPathPositions must be denied before forwarding:
+// silently ignoring the tail would let it bypass cross-request inspection.
+type ceePathPayload struct {
+	segments      [][]byte
+	depthExceeded bool
 }
 
 // maxCEEBodyRead limits the body bytes read for CEE payload extraction.
@@ -231,14 +253,68 @@ func queryParamKeys(u *url.URL) []byte {
 }
 
 // urlPayload extracts query parameter values in wire order from a parsed URL.
-// Path components are intentionally excluded: repeated paths across requests
-// break DLP regex contiguity in the fragment buffer (e.g. "/get" inserted
-// between fragments makes "AKIA" + "IOSFODNN7EXAMPLE" become
-// "/getAKIA.../getIOSF..." which DLP cannot match). Path-based exfiltration
-// is already caught by per-request DLP (layer 3) and path entropy (layer 4).
+// Path components are excluded here and carried by pathSegments instead, on a
+// separate fragment stream: concatenating whole paths into this stream would
+// interleave static route text between the halves of a split secret and would
+// spend the per-session byte cap on requests that carry no data.
 // Used by the fetch handler where the request body is always empty (GET-only).
 func urlPayload(u *url.URL) []byte {
 	return queryParamPayload(u)
+}
+
+// pathSegments splits a URL path into decoded, non-empty segments in wire
+// order. It stops after scanner.MaxPathPositions segments without allocating a
+// slice for the remainder. The returned depth flag makes the CEE admission
+// fail closed rather than silently leaving a secret-bearing tail uninspected.
+//
+// CEE reassembles only equal absolute positions across requests. A fragment
+// that shifts from one position to another is deliberately not joined: there
+// is no route-independent ordering proof that it belongs in the same stream.
+func pathSegments(u *url.URL) *ceePathPayload {
+	if u == nil {
+		return nil
+	}
+	// Split the ESCAPED path, then decode each segment. u.Path is already
+	// percent-decoded, so splitting it treats an encoded slash as a separator:
+	// "/upload/value%2Ftail" would become three positions when the wire carried
+	// two, shifting every later position and breaking reassembly against the
+	// same route seen without the escape.
+	raw := u.EscapedPath()
+	if raw == "" {
+		raw = u.RawPath
+	}
+	if raw == "" {
+		raw = u.Path
+	}
+	if raw == "" || raw == "/" {
+		return nil
+	}
+	payload := &ceePathPayload{}
+	for raw != "" {
+		part := raw
+		if slash := strings.IndexByte(raw, '/'); slash >= 0 {
+			part, raw = raw[:slash], raw[slash+1:]
+		} else {
+			raw = ""
+		}
+		if part == "" {
+			continue
+		}
+		if len(payload.segments) == scanner.MaxPathPositions {
+			payload.depthExceeded = true
+			break
+		}
+		// Decode after splitting so an encoded slash stays inside its segment.
+		decoded, err := url.PathUnescape(part)
+		if err != nil {
+			decoded = part
+		}
+		payload.segments = append(payload.segments, []byte(decoded))
+	}
+	if len(payload.segments) == 0 && !payload.depthExceeded {
+		return nil
+	}
+	return payload
 }
 
 // extractOutboundPayload extracts the outbound data visible to the proxy for
@@ -264,11 +340,10 @@ func ceeEntropyExempt(targetURL string, exemptDomains []string) bool {
 }
 
 // entropy measurement and fragment buffering. Includes query parameter values
-// in wire order and request body content. URL path is intentionally excluded:
-// repeated paths across requests break DLP regex contiguity in the fragment
-// buffer. Path-based exfiltration is already caught by per-request DLP (layer
-// 3) and path entropy (layer 4). Re-wraps r.Body after reading so downstream
-// handlers can still consume it.
+// in wire order and request body content. The URL path is excluded here and
+// carried separately by pathSegments, so static route text cannot interleave
+// with this stream. Re-wraps r.Body after reading so downstream handlers can
+// still consume it.
 func extractOutboundPayload(r *http.Request) []byte {
 	var parts []string
 
@@ -326,11 +401,13 @@ type ceeResult struct {
 // indicating whether the request should be blocked. Callers are responsible for
 // writing the HTTP response and recording metrics/signals based on the result.
 //
-// Two fragment streams are scanned independently:
+// Three fragment streams are scanned independently:
 //   - outbound (values + bare tokens + body): reconstructs secrets split
 //     across parameter values or request bodies
 //   - keyPayload (query parameter names only): reconstructs secrets split across
 //     parameter names (e.g. ?AKIA=1 then ?IOSFODNN7EXAMPLE=2)
+//   - pathPayload (absolute URL path positions): reconstructs path fragments
+//     without repeated static route text interrupting the dynamic position
 //
 // Parameters:
 //   - sessionKey: the session identity from CeeSessionKey()
@@ -343,19 +420,37 @@ type ceeResult struct {
 //   - sc: scanner for DLP pattern matching in fragment buffer
 //   - logger: audit logger for event recording
 //   - m: metrics recorder
-func ceeAdmit(
-	ctx context.Context,
-	sessionKey string,
-	outbound, keyPayload []byte,
-	targetURL, agent, clientIP, requestID string,
-	ceeCfg config.CrossRequestDetection,
-	et *scanner.EntropyTracker,
-	fb *scanner.FragmentBuffer,
-	sc *scanner.Scanner,
-	logger *audit.Logger,
-	m *metrics.Metrics,
-) ceeResult {
-	if len(outbound) == 0 && len(keyPayload) == 0 {
+//
+// ceeAdmitOptions groups the admission inputs. A positional list this long
+// invites argument-order errors, and every added stream lengthened it further
+// (see the options-struct convention in CLAUDE.md).
+type ceeAdmitOptions struct {
+	SessionKey  string
+	Outbound    []byte
+	KeyPayload  []byte
+	PathPayload *ceePathPayload
+	TargetURL   string
+	Agent       string
+	ClientIP    string
+	RequestID   string
+	Config      config.CrossRequestDetection
+	Entropy     *scanner.EntropyTracker
+	Fragments   *scanner.FragmentBuffer
+	Scanner     *scanner.Scanner
+	Logger      *audit.Logger
+	Metrics     *metrics.Metrics
+}
+
+func ceeAdmit(ctx context.Context, opts ceeAdmitOptions) ceeResult {
+	sessionKey := opts.SessionKey
+	outbound, keyPayload := opts.Outbound, opts.KeyPayload
+	pathPayload := opts.PathPayload
+	targetURL, agent := opts.TargetURL, opts.Agent
+	clientIP, requestID := opts.ClientIP, opts.RequestID
+	ceeCfg := opts.Config
+	et, fb, sc := opts.Entropy, opts.Fragments, opts.Scanner
+	logger, m := opts.Logger, opts.Metrics
+	if len(outbound) == 0 && len(keyPayload) == 0 && (pathPayload == nil || (len(pathPayload.segments) == 0 && !pathPayload.depthExceeded)) {
 		return ceeResult{}
 	}
 
@@ -388,10 +483,30 @@ func ceeAdmit(
 		}
 	}
 
-	// Fragment reassembly DLP check (two independent streams).
+	// Depth enforcement is INDEPENDENT of fragment reassembly. A path deeper
+	// than the cap cannot be fully represented, so forwarding it merely because
+	// reassembly is disabled or unavailable would forward an uninspected
+	// request: a fail-open in the one direction this stream exists to close.
+	if pathPayload != nil && pathPayload.depthExceeded {
+		m.RecordCrossRequestPathDepthExceeded()
+		detail := fmt.Sprintf("URL path exceeds CEE depth cap (%d segments); request cannot be safely inspected",
+			scanner.MaxPathPositions)
+		actx := newHTTPAuditContext(logger, "CEE", targetURL, clientIP, requestID, agent)
+		logger.LogBlocked(actx, "cross_request_path_depth", detail)
+		result.Blocked = true
+		result.FragmentHit = true
+		result.Reason = detail
+		return result
+	}
+
+	// Fragment reassembly DLP check (three independent streams).
+	sctx := ceeStreamContext{
+		TargetURL: targetURL, Agent: agent, ClientIP: clientIP, RequestID: requestID,
+		Config: ceeCfg, Fragments: fb, Scanner: sc, Logger: logger, Metrics: m,
+	}
 	if fb != nil && ceeCfg.FragmentReassembly.Enabled {
 		// Stream 1: values + bare tokens + body.
-		if res := ceeFragmentScan(ctx, sessionKey, outbound, targetURL, agent, clientIP, requestID, ceeCfg, fb, sc, logger, m); res != nil {
+		if res := ceeFragmentScan(ctx, sessionKey, outbound, sctx); res != nil {
 			result.FragmentHit = true
 			if res.Blocked {
 				result.Blocked = true
@@ -403,8 +518,22 @@ func ceeAdmit(
 		// Stream 2: query parameter keys (separate buffer, catches secrets
 		// split across param names like ?AKIA=1 then ?IOSFODNN7EXAMPLE=2).
 		if len(keyPayload) > 0 {
-			keySessionKey := sessionKey + "|keys"
-			if res := ceeFragmentScan(ctx, keySessionKey, keyPayload, targetURL, agent, clientIP, requestID, ceeCfg, fb, sc, logger, m); res != nil {
+			keySessionKey := sessionKey + ceeStreamKeysSuffix
+			if res := ceeFragmentScan(ctx, keySessionKey, keyPayload, sctx); res != nil {
+				result.FragmentHit = true
+				if res.Blocked {
+					result.Blocked = true
+					result.Reason = res.Reason
+					return result
+				}
+			}
+		}
+
+		// Stream 3: URL path positions. Static route positions contribute once;
+		// a position that varies keeps every value in arrival order.
+		if pathPayload != nil && (len(pathPayload.segments) > 0 || pathPayload.depthExceeded) {
+			pathSessionKey := sessionKey + ceeStreamPathSuffix
+			if res := ceeFragmentScanSegments(ctx, pathSessionKey, pathPayload, sctx); res != nil {
 				result.FragmentHit = true
 				if res.Blocked {
 					result.Blocked = true
@@ -420,21 +549,64 @@ func ceeAdmit(
 
 // ceeFragmentScan appends data to a fragment buffer stream and scans for DLP
 // matches. Returns non-nil result if a match is found (blocked or warned).
-func ceeFragmentScan(
-	ctx context.Context,
-	bufferKey string,
-	data []byte,
-	targetURL, agent, clientIP, requestID string,
-	ceeCfg config.CrossRequestDetection,
-	fb *scanner.FragmentBuffer,
-	sc *scanner.Scanner,
-	logger *audit.Logger,
-	m *metrics.Metrics,
-) *ceeResult {
+// ceeStreamContext carries the per-request identifiers and collaborators that
+// every fragment stream needs. It exists so adding a stream does not lengthen
+// three positional signatures again (CLAUDE.md options-struct convention).
+type ceeStreamContext struct {
+	TargetURL string
+	Agent     string
+	ClientIP  string
+	RequestID string
+	Config    config.CrossRequestDetection
+	Fragments *scanner.FragmentBuffer
+	Scanner   *scanner.Scanner
+	Logger    *audit.Logger
+	Metrics   *metrics.Metrics
+}
+
+func ceeFragmentScan(ctx context.Context, bufferKey string, data []byte, sctx ceeStreamContext) *ceeResult {
+	fb := sctx.Fragments
 	if len(data) == 0 {
 		return nil
 	}
-	if appendResult := fb.Append(bufferKey, data); appendResult.CapacityExceeded {
+	return ceeFragmentEvaluate(ctx, bufferKey, fb.Append(bufferKey, data), false, sctx)
+}
+
+// ceeFragmentScanSegments is ceeFragmentScan for a position-aware path stream.
+// Static positions contribute once; changing positions retain every later
+// value, including repeats, so priming cannot suppress a completing suffix.
+func ceeFragmentScanSegments(ctx context.Context, bufferKey string, payload *ceePathPayload, sctx ceeStreamContext) *ceeResult {
+	fb := sctx.Fragments
+	if payload == nil {
+		return nil
+	}
+	// Over-depth paths are denied earlier in ceeAdmit, before the
+	// fragment-reassembly gate, so they never reach this point.
+	appendResult := fb.AppendPathSegments(bufferKey, payload.segments)
+	return ceeFragmentEvaluate(ctx, bufferKey, appendResult, true, sctx)
+}
+
+// ceeFragmentEvaluate turns an append outcome into a CEE result: it fails
+// closed on capacity exhaustion, then scans the reassembled stream for DLP
+// matches. Shared so every fragment stream reports identically.
+func ceeFragmentEvaluate(ctx context.Context, bufferKey string, appendResult scanner.FragmentAppendResult, pathStream bool, sctx ceeStreamContext) *ceeResult {
+	targetURL, agent := sctx.TargetURL, sctx.Agent
+	clientIP, requestID := sctx.ClientIP, sctx.RequestID
+	ceeCfg := sctx.Config
+	fb, sc := sctx.Fragments, sctx.Scanner
+	logger, m := sctx.Logger, sctx.Metrics
+	if appendResult.PathDepthExceeded {
+		m.RecordCrossRequestPathDepthExceeded()
+		detail := fmt.Sprintf("URL path exceeds CEE depth cap (%d segments); request cannot be safely inspected", scanner.MaxPathPositions)
+		actx := newHTTPAuditContext(logger, "CEE", targetURL, clientIP, requestID, agent)
+		logger.LogBlocked(actx, "cross_request_path_depth", detail)
+		return &ceeResult{
+			Blocked:     true,
+			FragmentHit: true,
+			Reason:      detail,
+		}
+	}
+	if appendResult.CapacityExceeded {
 		m.RecordCrossRequestFragmentCapacityExceeded()
 		detail := "fragment reassembly session capacity exhausted; request cannot be safely inspected"
 		actx := newHTTPAuditContext(logger, "CEE", targetURL, clientIP, requestID, agent)
@@ -446,6 +618,9 @@ func ceeFragmentScan(
 		}
 	}
 	matches := fb.ScanForSecrets(ctx, bufferKey, sc)
+	if pathStream {
+		matches = fb.ScanPathForSecrets(ctx, bufferKey, sc)
+	}
 	if len(matches) == 0 {
 		return nil
 	}

@@ -91,6 +91,12 @@ trap cleanup EXIT
 
 CONFIG="$WORKDIR/cline_mcp_settings.json"
 SEED="$WORKDIR/cline_mcp_settings.seed.json"
+# Every invocation that writes or reads a header sidecar must resolve the same
+# HOME, because the sidecar directory is derived from it. Pinning HOME on
+# install but not on remove makes remove look in the operator's real home,
+# reject the recorded path as escaping the sidecar directory, and silently
+# leave the entry wrapped with its credential file still on disk.
+E2E_HOME="$WORKDIR/empty-home"
 
 if [[ -n "${PIPELOCK_BIN:-}" ]]; then
   PIPELOCK="$PIPELOCK_BIN"
@@ -102,7 +108,9 @@ fi
 
 PASS=0
 FAIL=0
+SKIP=0
 FAILED_TESTS=()
+SKIPPED_TESTS=()
 
 # assert <description> <command>: runs the command, records pass/fail.
 assert() {
@@ -115,6 +123,48 @@ assert() {
     FAIL=$((FAIL + 1))
     FAILED_TESTS+=("$desc")
     echo "  FAIL  $desc"
+  fi
+}
+
+# skip <description> <reason>: records an assertion this host cannot run. The
+# reason is printed and summarized so a skipped check never reads as coverage.
+skip() {
+  SKIP=$((SKIP + 1))
+  SKIPPED_TESTS+=("$1 ($2)")
+  echo "  SKIP  $1 ($2)"
+}
+
+# Config discovery ends at a compiled-in system path that no environment
+# variable can suppress, so a host carrying a usable config there cannot
+# exercise the nothing-discoverable branch. Decide that from what the
+# invocation actually did rather than by probing the host: a separate probe
+# races the invocation, and reproducing discovery's regular-file and
+# permission predicate in shell would be a second copy of a security check
+# that is free to drift from the real one. The command reports exactly one of
+# the two outcomes on stderr, so the outcome itself says whether the branch
+# ran.
+assert_no_discovery_warning() {
+  local stderr_file="$1"
+  local desc="install stderr warns when no pipelock config is discoverable"
+  local warned discovered config
+  # Anchored whole-line matches against the two documented outcomes. A
+  # substring match would accept the phrase inside unrelated output, and
+  # matching only a line prefix would accept a truncated or malformed line.
+  warned=$(grep -c '^warning: no pipelock config found at PIPELOCK_CONFIG, .*to enable scanning\.$' "$stderr_file" || true)
+  discovered=$(grep -c '^Using config .* for the wrapped MCP proxy\.$' "$stderr_file" || true)
+  # Exactly one outcome is the only readable result. Both means the run
+  # contradicted itself and neither means the command said something we do not
+  # recognise; either way the outcome is unknown, and an unknown outcome fails
+  # rather than skipping, because a skip would record it as deliberately
+  # uncovered when in fact it was not understood.
+  if [ "$warned" -eq 1 ] && [ "$discovered" -eq 0 ]; then
+    assert "$desc" true
+  elif [ "$discovered" -eq 1 ] && [ "$warned" -eq 0 ]; then
+    config=$(sed -n 's/^Using config \(.*\) for the wrapped MCP proxy\.$/\1/p' "$stderr_file")
+    skip "$desc" "$config was discoverable on this host"
+  else
+    echo "    unreadable discovery outcome: warned=$warned discovered=$discovered" >&2
+    assert "$desc" false
   fi
 }
 
@@ -206,12 +256,11 @@ echo "[1] install"
 # Suppress pipelock config auto-discovery so this script remains hermetic and
 # does not pick up the operator's $HOME pipelock.yaml. Operators get
 # auto-discovery; the test asserts the no-discovery warning instead.
-PIPELOCK_CONFIG="" XDG_CONFIG_HOME="$WORKDIR/empty-xdg" HOME="$WORKDIR/empty-home" \
+PIPELOCK_CONFIG="" XDG_CONFIG_HOME="$WORKDIR/empty-xdg" HOME="$E2E_HOME" \
   "$PIPELOCK" cline install --path "$CONFIG" >"$WORKDIR/install.stdout" 2>"$WORKDIR/install.stderr"
 assert "install exit 0" test -s "$WORKDIR/install.stdout"
 assert "install stdout reports 2 wrapped" grep -q "Wrapped 2 server(s)" "$WORKDIR/install.stdout"
-assert "install stderr warns when no pipelock config is discoverable" \
-  grep -q "no pipelock config found" "$WORKDIR/install.stderr"
+assert_no_discovery_warning "$WORKDIR/install.stderr"
 
 # Second install pass exercises the auto-discovery branch against a seeded
 # user config in a controlled HOME. The wrapped argv must carry --config.
@@ -322,7 +371,7 @@ assert "wrapped argv parses without cobra error" \
 echo ""
 echo "[4] remove and restore"
 
-"$PIPELOCK" cline remove --path "$CONFIG" >"$WORKDIR/remove.stdout" 2>"$WORKDIR/remove.stderr"
+HOME="$E2E_HOME" "$PIPELOCK" cline remove --path "$CONFIG" >"$WORKDIR/remove.stdout" 2>"$WORKDIR/remove.stderr"
 assert "remove exit 0" test -s "$WORKDIR/remove.stdout"
 assert "remove stdout reports 2 unwrapped" grep -q "Unwrapped 2 server(s)" "$WORKDIR/remove.stdout"
 
@@ -353,14 +402,23 @@ echo "[5] idempotence: re-run install on already-installed config (no double-wra
 
 # Re-run install on the (restored) config; should wrap both servers exactly
 # once. Then re-run on the wrapped config; should skip both.
-"$PIPELOCK" cline install --path "$CONFIG" >/dev/null 2>&1
-"$PIPELOCK" cline install --path "$CONFIG" >"$WORKDIR/install2.stdout" 2>&1
+HOME="$E2E_HOME" "$PIPELOCK" cline install --path "$CONFIG" >/dev/null 2>&1
+HOME="$E2E_HOME" "$PIPELOCK" cline install --path "$CONFIG" >"$WORKDIR/install2.stdout" 2>&1
 assert "second install skipped both servers" grep -q "Wrapped 0 server(s).*(2 already wrapped)" "$WORKDIR/install2.stdout"
 
 echo ""
 echo "=== Summary ==="
 echo "PASS: $PASS"
 echo "FAIL: $FAIL"
+echo "SKIP: $SKIP"
+
+if [[ $SKIP -gt 0 ]]; then
+  echo ""
+  echo "Skipped assertions (not covered on this host):"
+  for t in "${SKIPPED_TESTS[@]}"; do
+    echo "  - $t"
+  done
+fi
 
 if [[ $FAIL -gt 0 ]]; then
   echo ""

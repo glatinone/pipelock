@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/authority"
 	"github.com/luckyPipewrench/pipelock/internal/capture"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/contract/proxydecision"
@@ -175,6 +176,13 @@ type MCPProxyOpts struct {
 	AuditLogger *audit.Logger
 	Metrics     *metrics.Metrics
 
+	// AuthorityVerifier validates external grants immediately before an MCP
+	// request is forwarded. AuthorityActor and AuthorityDestination are
+	// resolved by the trusted transport/runtime, never from client metadata.
+	AuthorityVerifier    authority.Verifier
+	AuthorityActor       string
+	AuthorityDestination string
+
 	// Redirect handler runtime config (nil-safe).
 	RedirectRT   *RedirectRuntime
 	RedirectRTFn func() *RedirectRuntime
@@ -187,6 +195,14 @@ type MCPProxyOpts struct {
 	A2ACfg       *config.A2AScanning
 	A2ACfgFn     func() *config.A2AScanning
 	CardBaseline *CardBaseline
+	// A2ACardURL is the Agent Card origin used for signature verification
+	// and drift keys on MCP transports that have an upstream URL. Empty
+	// is valid for stdio; origin-scoped signature checks then fail closed.
+	A2ACardURL string
+	// A2ACardAuthFingerprint partitions Agent Card drift baselines by the
+	// effective upstream Authorization credential. It is a truncated digest,
+	// never the credential itself.
+	A2ACardAuthFingerprint string
 
 	// MediaPolicy enforces response-side media handling for base64 tool
 	// result content blocks (image/audio/video) before generic text scanning.
@@ -584,6 +600,18 @@ func (o MCPProxyOpts) a2aCfg() *config.A2AScanning {
 		return o.A2ACfgFn()
 	}
 	return o.A2ACfg
+}
+
+func (o MCPProxyOpts) a2aResponseOpts(scanOpts ResponseScanOptions) *A2AResponseOpts {
+	return &A2AResponseOpts{
+		Cfg:      o.a2aCfg(),
+		Baseline: o.CardBaseline,
+		CardKey: cardCacheKey{
+			cardURL:         o.A2ACardURL,
+			authFingerprint: o.A2ACardAuthFingerprint,
+		},
+		ScanOpts: scanOpts,
+	}
 }
 
 func (o MCPProxyOpts) mediaPolicy() *config.MediaPolicy {

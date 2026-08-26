@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
@@ -44,6 +46,13 @@ func RunWSProxy(
 	if opts.ContractServer == "" {
 		opts.ContractServer = mcpContractServerFromUpstream(upstreamURL)
 	}
+	if opts.AuthorityDestination == "" {
+		opts.AuthorityDestination = upstreamURL
+	}
+	if opts.A2ACardURL == "" {
+		opts.A2ACardURL = upstreamURL
+	}
+	opts.A2ACardURL = a2aCardURLForWSUpstream(opts.A2ACardURL)
 	if gate, gateErr := evaluateMCPUpstreamGate(ctx, upstreamURL, opts); gateErr != nil {
 		return fmt.Errorf("contract upstream evaluation: %w", gateErr)
 	} else if gate.Verdict == config.ActionBlock {
@@ -63,24 +72,15 @@ func RunWSProxy(
 	}
 	defer recordMCPBaselineSample(opts, rec)
 
-	wsClient, err := transport.NewWSClientWithDialer(innerCtx, upstreamURL, opts.DialContext)
-	if err != nil {
-		return fmt.Errorf("connecting to upstream: %w", err)
-	}
+	var wsClient *transport.WSClient
 
-	// Force-close connection on external cancellation (SIGINT, SIGTERM, parent
-	// timeout). This unblocks ForwardScanned's ReadMessage which blocks on raw
-	// TCP reads that don't respect context cancellation. WSClient.Close is safe
-	// to call multiple times (sync.Once guard).
+	// Force-close a connection on external cancellation (SIGINT, SIGTERM,
+	// parent timeout). The connection is established lazily when authority
+	// verification is enabled so a rejected first request cannot cause even an
+	// upstream handshake. With no verifier, startUpstream is called immediately
+	// below and preserves the previous eager-connect behavior.
 	done := make(chan struct{})
 	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = wsClient.Close()
-		case <-done:
-		}
-	}()
 
 	// Request tracker for confused deputy protection.
 	tracker := NewRequestTracker()
@@ -121,18 +121,45 @@ func RunWSProxy(
 	var wg sync.WaitGroup
 	var lastScanErr error
 
-	// Upstream -> stdout goroutine: scan responses via ForwardScanned.
-	// WSClient implements MessageReader; ForwardScanned loops until EOF.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer cancel() // Signal main goroutine if upstream closes first.
-		_, scanErr := ForwardScanned(wsClient, safeClientOut, safeLogW, tracker, wsOpts)
-		if scanErr != nil {
-			_, _ = fmt.Fprintf(safeLogW, "pipelock: upstream scan error: %v\n", scanErr)
-			lastScanErr = scanErr
+	startUpstream := func() error {
+		if wsClient != nil {
+			return nil
 		}
-	}()
+		var err error
+		wsClient, err = transport.NewWSClientWithDialer(innerCtx, upstreamURL, opts.DialContext)
+		if err != nil {
+			return fmt.Errorf("connecting to upstream: %w", err)
+		}
+		go func(client *transport.WSClient) {
+			select {
+			case <-ctx.Done():
+				_ = client.Close()
+			case <-done:
+			}
+		}(wsClient)
+
+		// Upstream -> stdout goroutine: scan responses via ForwardScanned.
+		// WSClient implements MessageReader; ForwardScanned loops until EOF.
+		wg.Add(1)
+		go func(client *transport.WSClient) {
+			defer wg.Done()
+			defer cancel() // Signal main goroutine if upstream closes first.
+			_, scanErr := ForwardScanned(client, safeClientOut, safeLogW, tracker, wsOpts)
+			if scanErr != nil {
+				_, _ = fmt.Fprintf(safeLogW, "pipelock: upstream scan error: %v\n", scanErr)
+				lastScanErr = scanErr
+			}
+		}(wsClient)
+		return nil
+	}
+	if opts.AuthorityVerifier == nil {
+		if err := startUpstream(); err != nil {
+			if sessionExit.inProgress() && errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return err
+		}
+	}
 
 	// Stdin -> upstream loop (runs on main goroutine).
 	var stdinErr error
@@ -153,7 +180,9 @@ func RunWSProxy(
 		select {
 		case <-innerCtx.Done():
 			// Upstream closed or external cancellation.
-			_ = wsClient.Close()
+			if wsClient != nil {
+				_ = wsClient.Close()
+			}
 			wg.Wait()
 			if stdinErr != nil {
 				return stdinErr
@@ -201,11 +230,22 @@ func RunWSProxy(
 			continue
 		}
 
+		// With authority enabled, delay the upstream TCP/WebSocket handshake
+		// until the first message has passed every existing gate plus the grant
+		// check in scanHTTPInputDecision.
+		if err := startUpstream(); err != nil {
+			if sessionExit.inProgress() && errors.Is(err, context.Canceled) {
+				break
+			}
+			stdinErr = err
+			break
+		}
+
 		// Track request ID before forwarding for confused deputy protection.
 		// Only track requests (have "method"), not client responses to
 		// server-initiated calls, to prevent tracker pollution.
 		if isRequest(msg) {
-			tracker.Track(frame.ID)
+			tracker.TrackRequest(frame.ID, frame.Method)
 		}
 
 		// Forward to upstream.
@@ -221,7 +261,9 @@ func RunWSProxy(
 	// which ForwardScanned treats as a clean stream end via
 	// wsutil.IsExpectedCloseErr, so it exits without a spurious error.
 	cancel()
-	_ = wsClient.Close()
+	if wsClient != nil {
+		_ = wsClient.Close()
+	}
 	wg.Wait()
 
 	if stdinErr != nil {
@@ -231,4 +273,21 @@ func RunWSProxy(
 		return lastScanErr
 	}
 	return nil
+}
+
+// a2aCardURLForWSUpstream maps a WebSocket endpoint to the equivalent HTTP
+// origin used by Agent Card signature key scopes. The path remains part of the
+// drift key, while ws and wss carry the same authority as http and https.
+func a2aCardURLForWSUpstream(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "ws":
+		u.Scheme = "http"
+	case "wss":
+		u.Scheme = "https"
+	}
+	return u.String()
 }

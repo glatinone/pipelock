@@ -60,6 +60,7 @@ func licenseKeygenCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "keygen",
 		Short: "Generate Ed25519 keypair for signing license tokens",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if outDir == "" {
 				home, err := os.UserHomeDir()
@@ -128,6 +129,7 @@ func licenseIssueCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "issue",
 		Short: "Issue a signed license token",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if keyPath == "" {
 				home, err := os.UserHomeDir()
@@ -403,20 +405,23 @@ func licenseInspectCmd() *cobra.Command {
 }
 
 type licenseStatusReport struct {
-	Status              string `json:"status"`
-	LicenseID           string `json:"license_id,omitempty"`
-	Tier                string `json:"tier,omitempty"`
-	SubscriptionID      string `json:"subscription_id,omitempty"`
-	ExpiresAt           string `json:"expires_at,omitempty"`
-	DaysRemaining       int    `json:"days_remaining,omitempty"`
-	WarningBand         int    `json:"warning_band,omitempty"`
-	Severity            string `json:"severity,omitempty"`
-	CRLConfigured       bool   `json:"crl_configured"`
-	CRLExpiresAt        string `json:"crl_expires_at,omitempty"`
-	CRLSHA256           string `json:"crl_sha256,omitempty"`
-	Intermediate        bool   `json:"intermediate_configured"`
-	RequireIntermediate bool   `json:"require_intermediate"`
-	Reason              string `json:"reason,omitempty"`
+	Status              string   `json:"status"`
+	LicenseID           string   `json:"license_id,omitempty"`
+	Org                 string   `json:"org,omitempty"`
+	Features            []string `json:"features,omitempty"`
+	Tier                string   `json:"tier,omitempty"`
+	SubscriptionID      string   `json:"subscription_id,omitempty"`
+	ExpiresAt           string   `json:"expires_at,omitempty"`
+	DaysRemaining       int      `json:"days_remaining,omitempty"`
+	WarningBand         int      `json:"warning_band,omitempty"`
+	Severity            string   `json:"severity,omitempty"`
+	Warning             string   `json:"warning,omitempty"`
+	CRLConfigured       bool     `json:"crl_configured"`
+	CRLExpiresAt        string   `json:"crl_expires_at,omitempty"`
+	CRLSHA256           string   `json:"crl_sha256,omitempty"`
+	Intermediate        bool     `json:"intermediate_configured"`
+	RequireIntermediate bool     `json:"require_intermediate"`
+	Reason              string   `json:"reason,omitempty"`
 }
 
 func licenseStatusCmd() *cobra.Command {
@@ -428,6 +433,7 @@ func licenseStatusCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Verify the configured license and show renewal status",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			report, err := buildLicenseStatusReport(configFile, crlFile)
 			if jsonOutput {
@@ -512,12 +518,22 @@ func buildLicenseStatusReport(configFile, crlFile string) (licenseStatusReport, 
 	report.LicenseID = lic.ID
 	report.Tier = lic.Tier
 	report.SubscriptionID = lic.SubscriptionID
+	// Features and org come from the token this command just VERIFIED. Without
+	// them status answered "are you licensed" but not "for what", so an operator
+	// asking the question that actually matters, whether fleet or agents is live,
+	// had to fall back to `license inspect`, which prints features and states
+	// plainly that it does not check the signature. That left no single verified
+	// view of entitlements: the command that verifies would not show them and the
+	// one that showed them would not verify.
+	report.Org = lic.Org
+	report.Features = lic.Features
 	if lic.ExpiresAt > 0 {
 		report.ExpiresAt = time.Unix(lic.ExpiresAt, 0).UTC().Format(time.DateOnly)
 		warn := license.ExpiryStatus(lic, time.Now())
 		report.DaysRemaining = warn.DaysRemaining
 		report.WarningBand = warn.ThresholdDays
 		report.Severity = warn.Severity
+		report.Warning = warn.Message()
 	}
 	if err != nil {
 		switch {
@@ -646,16 +662,22 @@ func printLicenseStatus(cmd *cobra.Command, report licenseStatusReport) {
 	if report.LicenseID != "" {
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  ID:       %s\n", report.LicenseID)
 	}
+	if report.Org != "" {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  Org:      %s\n", report.Org)
+	}
 	if report.Tier != "" {
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  Tier:     %s\n", report.Tier)
+	}
+	if len(report.Features) > 0 {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  Features: %s\n", strings.Join(report.Features, ", "))
 	}
 	if report.SubscriptionID != "" {
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  Sub ID:   %s\n", report.SubscriptionID)
 	}
 	if report.ExpiresAt != "" {
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  Expires:  %s (%d day(s) remaining)\n", report.ExpiresAt, report.DaysRemaining)
-		if report.WarningBand > 0 {
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  Warning:  %d-day renewal band (%s)\n", report.WarningBand, report.Severity)
+		if report.Warning != "" {
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  Warning:  %s\n", report.Warning)
 		}
 	} else if report.Status == licenseStatusValid {
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  Expires:  never\n")

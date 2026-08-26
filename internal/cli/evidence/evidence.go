@@ -38,6 +38,11 @@ func Cmd() *cobra.Command {
 	cmd.AddCommand(viewCmd())
 	cmd.AddCommand(serveCmd())
 	cmd.AddCommand(expireCmd())
+	cmd.AddCommand(compactCmd())
+	cmd.AddCommand(inspectEpochsCmd())
+	cmd.AddCommand(verifyEpochPinCmd())
+	cmd.AddCommand(inventoryLegacyEpochsCmd())
+	cmd.AddCommand(verifyLegacyEpochInventoryCmd())
 	cmd.AddCommand(doctorCmd())
 	cmd.AddCommand(verifyCertCmd())
 	return cmd

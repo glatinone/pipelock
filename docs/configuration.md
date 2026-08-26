@@ -633,7 +633,7 @@ websocket_proxy:
 | `enabled` | `false` | **Yes** | Enable /ws endpoint |
 | `max_message_bytes` | `1048576` | No | Max assembled message size |
 | `max_concurrent_connections` | `128` | No | Connection limit |
-| `scan_text_frames` | `true` | No | DLP + injection on text frames |
+| `scan_text_frames` | `true` | No | Scan text and Ping/Pong payloads for outbound DLP and inbound prompt injection |
 | `allow_binary_frames` | `false` | No | Allow binary frames (not scanned) |
 | `strip_compression` | `true` | No | Accepted for compatibility; the relay always disables permessage-deflate and rejects compressed (RSV1) frames regardless of this value, so frames are always scanned uncompressed |
 | `max_connection_seconds` | `3600` | No | Upstream WebSocket setup/dial deadline |
@@ -891,7 +891,7 @@ response_scanning:
       expires: "2099-12-31"
   mcp_servers:                  # MCP response trust classes; default is untrusted/block
     - server: "analysis-server"
-      trust: "reasoning"        # reasoning => warn; untrusted => block
+      trust: "reasoning"        # reasoning permits warn when action is warn; untrusted => block
   patterns:
     - name: "Custom Injection"
       regex: 'override system prompt'
@@ -908,7 +908,7 @@ response_scanning:
 | `size_exempt_scan_max_bytes` | `67108864` | Maximum bytes read into memory for one over-cap response from a `size_exempt_domains` host before the existing response scanners run. Exceeding this ceiling blocks fail-closed with no upstream bytes delivered. |
 | `size_exempt_scan_max_inflight_bytes` | `268435456` | Per-proxy-instance memory reservation budget for concurrent over-cap size-exempt scans. If a scan cannot reserve its ceiling immediately, the response blocks fail-closed instead of waiting. |
 | `unscannable_passthrough` | `[]` | Structured allowlist for deliberately unscannable opaque artifact responses. Matching entries stream unscanned and emit an audit warning plus an allow receipt on every use. Requires `host`, exact `paths`, non-textual `content_types`, `reason`, and non-expired `expires`; optional `added` documents the entry. The host must also match `size_exempt_domains`, the response must exceed the normal scan cap, include a positive `Content-Length`, and declare `Content-Disposition: attachment`. |
-| `mcp_servers` | `[]` | Per-MCP-server response trust classes keyed by `pipelock mcp proxy --server-name`. Omitted, missing, malformed, or non-matching servers are treated as `untrusted` and block response-injection findings. `reasoning` is an explicit opt-in that logs/warns but forwards the response. |
+| `mcp_servers` | `[]` | Per-MCP-server response trust classes keyed by `pipelock mcp proxy --server-name`. A server that is omitted, missing, or does not match an entry is treated as `untrusted` and blocks response-injection findings. A malformed entry is not a fallback: an unknown trust value, an invalid server name, or a duplicate entry fails config validation, so the configuration does not load. `reasoning` permits warn-and-forward only when `response_scanning.action` is `warn`; a stricter section action still applies. |
 | `patterns` | 33 built-in | Injection and state/control poisoning patterns |
 
 **Built-in patterns (33):** Prompt-injection and state/control poisoning coverage includes jailbreak phrases, system overrides, role overrides, instruction manipulation, encoded payloads, tool invocation commands, authority escalation, credential solicitation, credential path directives, auth material requirements, memory persistence directives, preference poisoning, covert-action directives, silent credential handling, and CJK-language override patterns. All patterns use DOTALL mode to match across newlines in multiline tool output.
@@ -921,18 +921,19 @@ response_scanning:
 
 **MCP required control:** `response_scanning.enabled: false` is currently ignored in `pipelock mcp proxy` and `pipelock mcp scan` modes because MCP response scanning is required. Pipelock runs with default response scanning and prints a warning naming the overridden field. `pipelock mcp scan` scans stdin responses for prompt injection and generic inbound credential patterns. It intentionally skips agent-owned environment and file-secret matching because receiving an agent-owned value is not exfiltration. It does not run tool policy or input scanning. JSON verdicts include `scanned: ["response_injection", "response_dlp"]` to make that scope explicit. This compatibility fallback will become a startup/reload error in a future release; remove the disable to silence the warning.
 
-**Exempt domains:** Trusted response APIs can return instruction-like text as part of normal operation, which can trigger false positives. Use `exempt_domains` to skip injection scanning for trusted providers. DLP scanning on the outbound request still runs — only the response injection scan is skipped. Applies to fetch proxy, forward proxy, CONNECT (TLS intercept), WebSocket, and reverse proxy. Does not affect MCP response scanning; MCP uses `response_scanning.mcp_servers` so a reasoning-model MCP server can warn while web-relay MCP servers keep blocking.
+**Exempt domains:** Trusted response APIs can return instruction-like text as part of normal operation, which can trigger false positives. Use `exempt_domains` to skip injection scanning for trusted providers. DLP scanning on the outbound request still runs, and only the response injection scan is skipped. Applies to fetch proxy, forward proxy, CONNECT (TLS intercept), WebSocket, and reverse proxy. Does not affect MCP response scanning; MCP uses `response_scanning.mcp_servers`, and a reasoning-model MCP server can warn only when the enclosing response action is also `warn`.
 
-**MCP response trust classes:** MCP response scanning defaults to `untrusted`, which blocks response-injection findings even if the generic `response_scanning.action` is `warn`. This protects web-relay servers such as fetch/search/scraping tools. To allow a reasoning-model MCP server to answer security-analysis questions that quote canonical jailbreak strings, opt in by server name:
+**MCP response trust classes:** MCP response scanning defaults to `untrusted`, which blocks response-injection findings even if the generic `response_scanning.action` is `warn`. This protects web-relay servers such as fetch/search/scraping tools. A trust class can tighten the enclosing `response_scanning.action`, but it cannot weaken it. To allow a reasoning-model MCP server to answer security-analysis questions that quote canonical jailbreak strings, set the enclosing action to `warn` and opt in by server name:
 
 ```yaml
 response_scanning:
+  action: warn
   mcp_servers:
     - server: "analysis-server"
       trust: "reasoning"
 ```
 
-`reasoning` maps to `warn`; `untrusted` maps to `block`. Unknown trust values fail config validation, duplicate server entries fail validation, and entries are surfaced as warnings when `response_scanning.enabled` is false. The trust decision applies to MCP stdio, stdio-to-HTTP, reverse Streamable HTTP/SSE, and WebSocket surfaces because they share the MCP response scan gate. Block logs and JSON-RPC errors name the server, matched pattern, and trust class so operators can see whether a server needs an explicit trust-class review.
+`reasoning` maps to `warn`; `untrusted` maps to `block`. Pipelock applies the stricter of that mapping and `response_scanning.action`, so `block`, `ask`, and `strip` still apply to a reasoning server. Unknown trust values fail config validation, duplicate server entries fail validation, and entries are surfaced as warnings when `response_scanning.enabled` is false. The trust decision applies to MCP stdio, stdio-to-HTTP, reverse Streamable HTTP/SSE, and WebSocket surfaces because they share the MCP response scan gate. Block logs and JSON-RPC errors name the server, matched pattern, and trust class so operators can see whether a server needs an explicit trust-class review.
 
 Response trust does not make a server trusted for taint propagation. If a reasoning server is also an operator-trusted source whose clean responses should not contaminate the session, add the same `--server-name` value under `taint.trusted_mcp_servers`. Prompt-injection findings still raise hostile taint.
 
@@ -1770,6 +1771,8 @@ Fragment reassembly detects known DLP patterns inside the configured byte and ti
 
 Suppress known false positives by rule name and path/URL pattern.
 
+Top-level suppressions cannot name immutable core DLP or core response patterns. Pipelock rejects those entries at startup and reload so a scoped exception cannot remove the minimum safety floor. Use `dlp.patterns[].exempt_domains` for a URL destination exception on a configurable DLP pattern. The core URL floor does not consult that field, and core body, header, URL, and response false positives require a pattern precision fix.
+
 ```yaml
 suppress:
   - rule: "Jailbreak Attempt"
@@ -1779,7 +1782,7 @@ suppress:
 
 | Field | Description |
 |-------|-------------|
-| `rule` | Pattern/rule name to suppress (required) |
+| `rule` | Non-core pattern/rule name to suppress (required). Core floor names fail validation. |
 | `path` | Exact path, glob, or URL suffix (required) |
 | `reason` | Human-readable justification |
 
@@ -3438,6 +3441,7 @@ reverse_proxy:
   enabled: false
   listen: ":8890"
   upstream: "http://localhost:7899"
+  max_inflight_scan_bytes: 67108864  # 64 MiB across buffered request scans
 ```
 
 | Field | Default | Description |
@@ -3445,6 +3449,7 @@ reverse_proxy:
 | `enabled` | `false` | Enable reverse proxy mode |
 | `listen` | (required) | Listen address for the reverse proxy |
 | `upstream` | (required) | Upstream service URL to forward to |
+| `max_inflight_scan_bytes` | `67108864` | Per-instance byte budget for buffered request-body scans. A request that cannot reserve capacity is denied before its body is read. Must be at least `request_body_scanning.max_body_bytes` when request-body scanning is enabled. |
 
 ### Submit Profile
 
@@ -3464,7 +3469,7 @@ reverse_proxy:
     port: 443
     reason: "submission endpoint"
     added: "2026-05-26"
-    expires: "2026-08-24"
+    expires: "2099-12-31"
   max_body_bytes: 1048576
   request_timeout_seconds: 10
 ```
@@ -3491,9 +3496,10 @@ pipelock run --reverse-proxy --reverse-upstream http://localhost:7899 --reverse-
 - **Request bodies:** Scanned for DLP patterns (secret exfiltration) using the `request_body_scanning` config
 - **Request headers:** Scanned when `request_body_scanning.scan_headers` is enabled
 - **Response bodies:** Scanned for prompt injection using the `response_scanning` config
-- **Binary content:** Image, audio, and video content types skip scanning
+- **Request bodies:** Image, audio, and video uploads are scanned under `request_body_scanning`; a valid media signature is not an exemption. This detects plaintext secrets appended to a media file, not secrets steganographically embedded in its pixels or samples.
 - **Compressed bodies:** Fail-closed (blocked) on both request and response
-- **Oversized bodies:** Bodies larger than 1MB pass through without scanning
+- **Oversized request bodies:** Bodies above `request_body_scanning.max_body_bytes` are denied. Known oversized `Content-Length` values are rejected before reading; chunked bodies are bounded while read and also consume the reverse-proxy in-flight scan budget.
+- **Scan admission exhaustion:** A request that cannot reserve capacity within `max_inflight_scan_bytes` is refused with 503 before its body is read, matching how Pipelock reports other temporary unavailability such as an engaged kill switch. This differs from the 413 an oversized body receives: 413 says the body will never be accepted at this cap, 503 says the instance is busy and the request is worth retrying.
 
 ### Hot-reload
 
